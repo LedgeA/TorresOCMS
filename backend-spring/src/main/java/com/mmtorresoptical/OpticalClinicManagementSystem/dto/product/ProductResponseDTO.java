@@ -1,0 +1,28 @@
+package com.mmtorresoptical.OpticalClinicManagementSystem.dto.product;
+
+import lombok.Data;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Data
+public class ProductResponseDTO {
+
+    private UUID productId;
+    private String productName;
+    private String imageDir;
+    private UUID categoryId;
+    private String categoryName;
+    private UUID supplierId;
+    private String supplierName;
+    private BigDecimal unitPrice;
+    private Integer quantity;
+    private String productType;
+    private Integer lowLevelThreshold;
+    private Integer overstockedThreshold;
+    private Boolean isArchived;
+    private Boolean isSeniorPwdEligible;
+    private Boolean isPerishable;
+    private LocalDateTime createdAt;
+}

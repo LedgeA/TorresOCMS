@@ -1,0 +1,155 @@
+package com.mmtorresoptical.OpticalClinicManagementSystem.controller;
+
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.DailyPatientPoint;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.DashboardPatientMetricsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.PatientMaintenanceMetricsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.PatientMetricsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.PatientProfileMetricsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.patient.PatientDetailsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.patient.PatientRequestDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.patient.PatientResponseDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.patient.PatientSearchResultDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.controller.PatientService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Page;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+import java.util.UUID;
+
+@RestController
+@RequiredArgsConstructor
+@RequestMapping("/api/admin/patients")
+public class PatientController {
+
+    private final PatientService patientService;
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @GetMapping("/summary")
+    public ResponseEntity<PatientMetricsDTO> getPatientMetrics() {
+        return ResponseEntity.ok(patientService.getPatientMetrics());
+    }
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @GetMapping("/{id}/profile-metrics")
+    public ResponseEntity<PatientProfileMetricsDTO> getPatientProfileMetrics(@PathVariable UUID id) {
+        return ResponseEntity.ok(patientService.getPatientProfileMetrics(id));
+    }
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @PostMapping
+    public ResponseEntity<Object> createPatient(@Valid @RequestBody PatientRequestDTO patientRequest) {
+
+        PatientResponseDTO response = patientService.createPatient(patientRequest);
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @GetMapping
+    public ResponseEntity<Page<PatientDetailsDTO>> getAllPatients(
+            @RequestParam(required = false) String keyword,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "ACTIVE") String archivedStatus,
+                                                                  @RequestParam(defaultValue = "10") int size,
+                                                                  @RequestParam(defaultValue = "fullNameSortable") String sortBy,
+            @RequestParam(defaultValue = "asc") String sortOrder,
+            @RequestParam(required = false) String sex) {
+
+        Page<PatientDetailsDTO> patientDetailsDTOS = patientService.getAllPatients(keyword, page, size, sortBy, sortOrder, archivedStatus, sex);
+
+        return ResponseEntity.ok(patientDetailsDTOS);
+    }
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @GetMapping("/{id}")
+    public ResponseEntity<PatientDetailsDTO> getPatientById(@PathVariable UUID id) {
+
+        PatientDetailsDTO responseDetails = patientService.getPatientById(id);
+
+        return ResponseEntity.ok(responseDetails);
+    }
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @PutMapping("/{id}")
+    public ResponseEntity<Object> updatePatient(@PathVariable UUID id, @Valid @RequestBody PatientRequestDTO patientRequest) {
+
+        PatientResponseDTO response = patientService.updatePatient(id, patientRequest);
+
+        return ResponseEntity.ok(response);
+    }
+
+    /**
+     * Searches patients by keyword (name, contact number, or UUID).
+     * Accessible to both ADMIN and STAFF for POS patient association.
+     *
+     * @param keyword search term (name, contact number, or patient ID)
+     * @param page page number (default 0)
+     * @param size page size (default 20)
+     * @return paginated list of PatientSearchResultDTO
+     */
+    @PreAuthorize("hasAnyRole('ADMIN', 'STAFF')")
+    @GetMapping("/search")
+    public ResponseEntity<Page<PatientSearchResultDTO>> searchPatients(
+            @RequestParam(required = false) String keyword,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+
+        Page<PatientSearchResultDTO> results = patientService.searchPatients(keyword, page, size);
+        return ResponseEntity.ok(results);
+    }
+
+    /**
+     * Archives a patient record by ID.
+     *
+     * This endpoint performs a soft delete by:
+     * - Retrieving the patient record
+     * - Marking it as archived
+     * - Persisting the update
+     *
+     * The record remains in the database but is excluded
+     * from active queries.
+     *
+     * @param id the unique identifier of the patient
+     * @return ResponseEntity with no content
+     */
+    @PreAuthorize("hasRole('ADMIN')")
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> archivePatient(@PathVariable UUID id) {
+
+        patientService.archivePatient(id);
+        return ResponseEntity.noContent().build();
+    }
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @PutMapping("/{id}/restore")
+    public ResponseEntity<Void> restorePatient(@PathVariable UUID id) {
+
+        patientService.restorePatient(id);
+
+        return ResponseEntity.noContent().build();
+    }
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @GetMapping("/dashboard-summary")
+    public ResponseEntity<DashboardPatientMetricsDTO> getDashboardPatientMetrics() {
+        return ResponseEntity.ok(patientService.getDashboardPatientMetrics());
+    }
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @GetMapping("/daily-arrivals")
+    public ResponseEntity<List<DailyPatientPoint>> getDailyPatientArrivals() {
+        return ResponseEntity.ok(patientService.getDailyPatientArrivals());
+    }
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @GetMapping("/maintenance-summary")
+    public ResponseEntity<PatientMaintenanceMetricsDTO> getMaintenanceMetrics() {
+        return ResponseEntity.ok(patientService.getMaintenanceMetrics());
+    }
+
+}

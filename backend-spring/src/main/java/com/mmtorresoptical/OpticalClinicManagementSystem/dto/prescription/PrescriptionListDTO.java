@@ -1,0 +1,24 @@
+package com.mmtorresoptical.OpticalClinicManagementSystem.dto.prescription;
+
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.user.UserSummaryDTO;
+import lombok.Data;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Data
+public class PrescriptionListDTO {
+
+    private UUID prescriptionId;
+    private String rxNumber;
+    private LocalDate issueDate;
+    private String notes;
+    private LocalDateTime createdAt;
+    private Boolean isArchived;
+    private String status;
+    private UUID eyeExamId;
+    private String eyeExamNumber;
+    private UserSummaryDTO createdBy;
+
+}

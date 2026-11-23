@@ -1,0 +1,332 @@
+package com.mmtorresoptical.OpticalClinicManagementSystem.repository.analytics;
+
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.CategoryBreakdownDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.ProductMetricsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.model.Product;
+import com.mmtorresoptical.OpticalClinicManagementSystem.objects.TopSellingProductDTO;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.UUID;
+
+@Repository
+public interface InventoryAnalyticsRepository extends JpaRepository<Product, UUID> {
+
+    @Query("""
+        SELECT COUNT(p)
+        FROM Product p
+        WHERE p.isArchived = false
+    """)
+    long countActiveProducts();
+
+    @Query("""
+        SELECT COALESCE(SUM(p.quantity), 0)
+        FROM Product p
+        WHERE p.isArchived = false
+    """)
+    long totalStockQuantity();
+
+    @Query("""
+        SELECT COUNT(p)
+        FROM Product p
+        WHERE p.isArchived = true
+    """)
+    long countArchivedProducts();
+
+    /*
+     * TOTAL INVENTORY VALUE
+     * (No date range needed – inventory is current state)
+     */
+    @Query("""
+        SELECT COALESCE(SUM(p.unitPrice * p.quantity), 0)
+        FROM Product p
+        WHERE p.isArchived = false
+          AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+    """)
+    BigDecimal inventoryValue();
+
+    @Query("""
+        SELECT COUNT(p)
+        FROM Product p
+        WHERE p.quantity <= p.lowLevelThreshold
+          AND p.isArchived = false
+          AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+    """)
+    long countLowStockProducts();
+
+    @Query("""
+        SELECT COUNT(p)
+        FROM Product p
+        WHERE p.quantity >= p.overstockedThreshold
+          AND p.isArchived = false
+          AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+    """)
+    long countOverstockedProducts();
+
+    @Query("""
+        SELECT p
+        FROM Product p
+        WHERE p.quantity <= p.lowLevelThreshold
+          AND p.isArchived = false
+          AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+    """)
+    Page<Product> findLowStockProducts(Pageable pageable);
+
+        @Query("""
+                SELECT p
+                FROM Product p
+                WHERE p.quantity <= p.lowLevelThreshold
+                    AND p.isArchived = false
+                    AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+        """)
+        List<Product> findLowStockProducts(Sort sort);
+
+    @Query("""
+        SELECT p
+        FROM Product p
+        WHERE p.quantity >= p.overstockedThreshold
+          AND p.isArchived = false
+          AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+    """)
+    Page<Product> findOverstockedProducts(Pageable pageable);
+
+        @Query("""
+                SELECT p
+                FROM Product p
+                WHERE p.quantity >= p.overstockedThreshold
+                    AND p.isArchived = false
+                    AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+        """)
+        List<Product> findOverstockedProducts(Sort sort);
+
+    @Query("""
+        SELECT COUNT(p)
+        FROM Product p
+        WHERE p.quantity = 0
+          AND p.isArchived = false
+          AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+    """)
+    long countOutOfStockProducts();
+
+    /*
+     * OUT OF STOCK LIST (Paginated)
+     */
+    @Query("""
+        SELECT p
+        FROM Product p
+        WHERE p.quantity = 0
+          AND p.isArchived = false
+          AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+    """)
+    Page<Product> findOutOfStockProducts(Pageable pageable);
+
+    /*
+     * OUT OF STOCK LIST (Sortable)
+     */
+    @Query("""
+        SELECT p
+        FROM Product p
+        WHERE p.quantity = 0
+            AND p.isArchived = false
+            AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+    """)
+    List<Product> findOutOfStockProducts(Sort sort);
+
+
+    /*
+     * TOP SELLING PRODUCTS BETWEEN DATE RANGE
+     * Fully parameterized
+     * Pageable controls limit
+     */
+    @Query("""
+    SELECT new com.mmtorresoptical.OpticalClinicManagementSystem.objects.TopSellingProductDTO(
+        p.productId,
+        p.productName,
+        c.name,
+        p.unitPrice,
+        SUM(ti.quantity - COALESCE(ti.refundedQuantity, 0)),
+        SUM(
+            ti.subtotal
+            -
+            COALESCE(
+                (SELECT SUM(ri.itemCreditAmount)
+                 FROM RefundItem ri
+                 WHERE ri.transactionItem = ti),
+                0
+            )
+        )
+    )
+    FROM TransactionItem ti
+    JOIN ti.transaction t
+    JOIN ti.product p
+    JOIN p.category c
+    WHERE t.transactionStatus IN (
+        com.mmtorresoptical.OpticalClinicManagementSystem.enums.TransactionStatus.PAID,
+        com.mmtorresoptical.OpticalClinicManagementSystem.enums.TransactionStatus.DEPOSIT
+    )
+      AND t.transactionDate >= :startDate
+      AND t.transactionDate < :endDate
+    GROUP BY p.productId, p.productName, c.name, p.unitPrice
+    HAVING SUM(ti.quantity - COALESCE(ti.refundedQuantity, 0)) > 0
+    ORDER BY SUM(
+        ti.subtotal
+        -
+        COALESCE(
+            (SELECT SUM(ri.itemCreditAmount)
+             FROM RefundItem ri
+             WHERE ri.transactionItem = ti),
+            0
+        )
+    ) DESC
+""")
+    List<TopSellingProductDTO> findTopSellingProducts(
+            @Param("startDate") LocalDateTime startDate,
+            @Param("endDate") LocalDateTime endDate,
+            Pageable pageable
+    );
+
+
+    /*
+     * TOP SELLING PRODUCTS BETWEEN DATE RANGE
+     * Fully parameterized
+     */
+    @Query("""
+    SELECT new com.mmtorresoptical.OpticalClinicManagementSystem.objects.TopSellingProductDTO(
+        p.productId,
+        p.productName,
+        c.name,
+        p.unitPrice,
+        SUM(ti.quantity - COALESCE(ti.refundedQuantity, 0)),
+        SUM(
+            ti.subtotal
+            -
+            COALESCE(
+                (SELECT SUM(ri.itemCreditAmount)
+                 FROM RefundItem ri
+                 WHERE ri.transactionItem = ti),
+                0
+            )
+        )
+    )
+    FROM TransactionItem ti
+    JOIN ti.transaction t
+    JOIN ti.product p
+    JOIN p.category c
+    WHERE t.transactionStatus IN (
+        com.mmtorresoptical.OpticalClinicManagementSystem.enums.TransactionStatus.PAID,
+        com.mmtorresoptical.OpticalClinicManagementSystem.enums.TransactionStatus.DEPOSIT
+    )
+      AND t.transactionDate >= :startDate
+      AND t.transactionDate < :endDate
+    GROUP BY p.productId, p.productName, c.name, p.unitPrice
+    HAVING SUM(ti.quantity - COALESCE(ti.refundedQuantity, 0)) > 0
+    ORDER BY SUM(
+        ti.subtotal
+        -
+        COALESCE(
+            (SELECT SUM(ri.itemCreditAmount)
+             FROM RefundItem ri
+             WHERE ri.transactionItem = ti),
+            0
+        )
+    ) DESC
+""")
+    List<TopSellingProductDTO> findTopSellingProducts(
+            @Param("startDate") LocalDateTime startDate,
+            @Param("endDate") LocalDateTime endDate
+    );
+
+    @Query("""
+    SELECT new com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.ProductMetricsDTO(
+        SUM(ti.quantity - COALESCE(ti.refundedQuantity, 0)),
+        SUM(
+            ti.subtotal
+            -
+            COALESCE(
+                (SELECT SUM(ri.itemCreditAmount)
+                 FROM RefundItem ri
+                 WHERE ri.transactionItem = ti),
+                0
+            )
+        ),
+        COUNT(DISTINCT t.transactionId),
+        MAX(t.transactionDate)
+    )
+    FROM TransactionItem ti
+    JOIN ti.transaction t
+    WHERE ti.product.productId = :productId
+      AND t.transactionStatus IN (
+        com.mmtorresoptical.OpticalClinicManagementSystem.enums.TransactionStatus.PAID,
+        com.mmtorresoptical.OpticalClinicManagementSystem.enums.TransactionStatus.DEPOSIT
+      )
+""")
+    ProductMetricsDTO findProductMetrics(@Param("productId") UUID productId);
+
+    /*
+     * CATEGORY BREAKDOWN — active physical products grouped by category
+     */
+    @Query("""
+        SELECT new com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.CategoryBreakdownDTO(
+            c.name,
+            COUNT(p),
+            COALESCE(SUM(p.unitPrice * p.quantity), 0)
+        )
+        FROM Product p
+        JOIN p.category c
+        WHERE p.isArchived = false
+          AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+        GROUP BY c.name
+        ORDER BY SUM(p.unitPrice * p.quantity) DESC
+    """)
+    List<CategoryBreakdownDTO> findCategoryBreakdown();
+
+    /*
+     * ARCHIVED INVENTORY VALUE — sum of unitPrice * quantity for archived PHYSICAL products
+     */
+    @Query("""
+        SELECT COALESCE(SUM(p.unitPrice * p.quantity), 0)
+        FROM Product p
+        WHERE p.isArchived = true
+          AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+    """)
+    BigDecimal archivedInventoryValue();
+
+    /*
+     * COUNT ARCHIVED PHYSICAL PRODUCTS WITH POSITIVE STOCK — orphaned stock audit flag
+     */
+    @Query("""
+        SELECT COUNT(p)
+        FROM Product p
+        WHERE p.isArchived = true
+          AND p.productType = com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType.PHYSICAL
+          AND p.quantity > 0
+    """)
+    long countArchivedWithStock();
+
+    /*
+     * BATCH DAILY SALES VELOCITY — returns [productId, totalNetUnitsSold]
+     * for PAID/DEPOSIT transactions in the past N days.
+     * Net units = quantity sold minus refunded quantity.
+     */
+    @Query("""
+        SELECT ti.product.productId, SUM(ti.quantity - COALESCE(ti.refundedQuantity, 0))
+        FROM TransactionItem ti
+        JOIN ti.transaction t
+        WHERE t.transactionStatus IN (
+            com.mmtorresoptical.OpticalClinicManagementSystem.enums.TransactionStatus.PAID,
+            com.mmtorresoptical.OpticalClinicManagementSystem.enums.TransactionStatus.DEPOSIT
+        )
+          AND t.transactionDate >= :sinceDate
+        GROUP BY ti.product.productId
+    """)
+    List<Object[]> sumUnitsSoldPerProductSince(@Param("sinceDate") LocalDateTime sinceDate);
+
+}

@@ -1,0 +1,169 @@
+package com.mmtorresoptical.OpticalClinicManagementSystem.controller;
+
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.auth.AdminResetPasswordRequestDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.auth.ChangePasswordRequestDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.auth.EnforcePasswordChangeRequestDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.auth.ForgotPasswordQuestionRequestDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.auth.LoginRequestDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.auth.LoginResponseDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.auth.MessageResponseDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.auth.PasswordResetRequestDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.auth.SecurityQuestionResponseDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.auth.VerifySecurityAnswerRequestDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.exception.custom.BadRequestException;
+import com.mmtorresoptical.OpticalClinicManagementSystem.model.User;
+import com.mmtorresoptical.OpticalClinicManagementSystem.repository.UserRepository;
+import com.mmtorresoptical.OpticalClinicManagementSystem.security.JwtTokenProvider;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.ActionType;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.ResourceType;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.AuthenticatedUserService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.auditlog.AuditLogService;
+
+import jakarta.validation.Valid;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Optional;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+    private final JwtTokenProvider jwtTokenProvider;
+    private final AuthenticatedUserService authenticatedUserService;
+    private final AuditLogService auditLogService;
+
+    AuthController(UserRepository userRepository, PasswordEncoder passwordEncoder, JwtTokenProvider jwtTokenProvider, AuthenticatedUserService authenticatedUserService, AuditLogService auditLogService) {
+        this.userRepository = userRepository;
+        this.passwordEncoder = passwordEncoder;
+        this.jwtTokenProvider = jwtTokenProvider;
+        this.authenticatedUserService = authenticatedUserService;
+        this.auditLogService = auditLogService;
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<?> authenticateUser(@Valid @RequestBody LoginRequestDTO loginRequest) {
+
+        String identifier = loginRequest.getLoginIdentifier();
+        Optional<User> userOptional = userRepository.findByUsernameOrEmail(identifier, identifier);
+
+        if (userOptional.isEmpty()) {
+            return ResponseEntity.status(401).body("Invalid credentials");
+        }
+
+        User user = userOptional.get();
+        if (!passwordEncoder.matches(loginRequest.getPassword(), user.getPasswordHash())) {
+            return ResponseEntity.status(401).body("Invalid credentials");
+        }
+
+        if (Boolean.TRUE.equals(user.getIsArchived())) {
+            return ResponseEntity.status(401).body("Account has been deactivated. Contact an administrator.");
+        }
+
+        String token = jwtTokenProvider.generateToken(user.getUsername(), user.getUserId(), user.getRole().name());
+
+        auditLogService.logForUser(ActionType.LOGIN, ResourceType.USER, user.getUserId(),
+                "User \"" + user.getUsername() + "\" logged in", "{}", user);
+
+        return ResponseEntity.ok(new LoginResponseDTO(token, user.isPwChangeRequired()));
+    }
+
+    @PostMapping("/change-password")
+    public ResponseEntity<MessageResponseDTO> changePassword(@Valid @RequestBody ChangePasswordRequestDTO request) {
+        User user = authenticatedUserService.getCurrentUser();
+
+        if (!passwordEncoder.matches(request.getCurrentPassword(), user.getPasswordHash())) {
+            throw new BadRequestException("Current password is incorrect");
+        }
+
+        if (passwordEncoder.matches(request.getNewPassword(), user.getPasswordHash())) {
+            throw new BadRequestException("New password must be different from current password");
+        }
+
+        user.setPasswordHash(passwordEncoder.encode(request.getNewPassword()));
+        userRepository.save(user);
+
+        return ResponseEntity.ok(new MessageResponseDTO("Password changed successfully"));
+    }
+
+    @PostMapping("/enforce-password-change")
+    public ResponseEntity<MessageResponseDTO> enforcePasswordChange(@Valid @RequestBody EnforcePasswordChangeRequestDTO request) {
+        User user = authenticatedUserService.getCurrentUser();
+
+        if (passwordEncoder.matches(request.getNewPassword(), user.getPasswordHash())) {
+            throw new BadRequestException("New password must be different from current password");
+        }
+
+        user.setPasswordHash(passwordEncoder.encode(request.getNewPassword()));
+        user.setSecurityQuestion(request.getSecurityQuestion());
+        user.setSecurityAnswerHash(passwordEncoder.encode(request.getSecurityAnswer()));
+        user.setPwChangeRequired(false);
+        userRepository.save(user);
+
+        return ResponseEntity.ok(new MessageResponseDTO("Password changed and security credentials set successfully"));
+    }
+
+    @PutMapping("/admin/reset-password/{id}")
+    public ResponseEntity<MessageResponseDTO> adminResetPassword(
+            @PathVariable UUID id,
+            @Valid @RequestBody AdminResetPasswordRequestDTO request) {
+        User user = userRepository.findById(id)
+                .orElseThrow(() -> new BadRequestException("User not found"));
+
+        user.setPasswordHash(passwordEncoder.encode(request.getTemporaryPassword()));
+        user.setPwChangeRequired(true);
+        userRepository.save(user);
+
+        return ResponseEntity.ok(new MessageResponseDTO("Password reset successfully"));
+    }
+
+    @PostMapping("/forgot-password/question")
+    public ResponseEntity<?> fetchSecurityQuestion(@Valid @RequestBody ForgotPasswordQuestionRequestDTO request) {
+        Optional<User> userOptional = userRepository.findByEmail(request.getEmail());
+        if (userOptional.isEmpty()) {
+            return ResponseEntity.ok(new MessageResponseDTO("If the email is registered, a security question will be provided."));
+        }
+
+        User user = userOptional.get();
+        return ResponseEntity.ok(new SecurityQuestionResponseDTO(user.getSecurityQuestion()));
+    }
+
+    @PostMapping("/forgot-password/verify")
+    public ResponseEntity<MessageResponseDTO> verifySecurityAnswer(@Valid @RequestBody VerifySecurityAnswerRequestDTO request) {
+        User user = userRepository.findByEmail(request.getEmail())
+                .orElseThrow(() -> new BadRequestException("Invalid email or security answer"));
+
+        if (!passwordEncoder.matches(request.getSecurityAnswer(), user.getSecurityAnswerHash())) {
+            throw new BadRequestException("Invalid email or security answer");
+        }
+
+        return ResponseEntity.ok(new MessageResponseDTO("Security answer verified"));
+    }
+
+    @PostMapping("/logout")
+    public ResponseEntity<MessageResponseDTO> logout() {
+        User user = authenticatedUserService.getCurrentUser();
+        auditLogService.log(ActionType.LOGOUT, ResourceType.USER, user.getUserId(),
+                "User \"" + user.getUsername() + "\" logged out", "{}");
+        return ResponseEntity.ok(new MessageResponseDTO("Logged out successfully"));
+    }
+
+    @PostMapping("/forgot-password/reset")
+    public ResponseEntity<MessageResponseDTO> resetPassword(@Valid @RequestBody PasswordResetRequestDTO request) {
+        User user = userRepository.findByEmail(request.getEmail())
+                .orElseThrow(() -> new BadRequestException("Invalid email or security answer"));
+
+        if (!passwordEncoder.matches(request.getSecurityAnswer(), user.getSecurityAnswerHash())) {
+            throw new BadRequestException("Invalid email or security answer");
+        }
+
+        user.setPasswordHash(passwordEncoder.encode(request.getNewPassword()));
+        userRepository.save(user);
+
+        return ResponseEntity.ok(new MessageResponseDTO("Password reset successfully"));
+    }
+}

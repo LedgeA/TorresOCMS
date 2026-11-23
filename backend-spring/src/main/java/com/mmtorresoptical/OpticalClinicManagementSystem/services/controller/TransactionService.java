@@ -1,0 +1,1042 @@
+package com.mmtorresoptical.OpticalClinicManagementSystem.services.controller;
+
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.DailyCashInflowPoint;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.TransactionMetricsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.payment.PaymentRequestDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.payment.PaymentResponseDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.refund.ItemRefundResponseDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.refund.RefundTransactionRequestDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.transaction.*;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.refund.RefundBatchAllocationDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.refund.RefundItemDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.FulfillmentStatus;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.DiscountType;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.PaymentMethod;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.PrescriptionStatus;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.ProductType;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.RefundStatus;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.TransactionStatus;
+import com.mmtorresoptical.OpticalClinicManagementSystem.exception.custom.BadRequestException;
+import com.mmtorresoptical.OpticalClinicManagementSystem.exception.custom.InsufficientStockException;
+import com.mmtorresoptical.OpticalClinicManagementSystem.exception.custom.ResourceNotFoundException;
+import com.mmtorresoptical.OpticalClinicManagementSystem.mapper.TransactionItemMapper;
+import com.mmtorresoptical.OpticalClinicManagementSystem.mapper.TransactionMapper;
+import com.mmtorresoptical.OpticalClinicManagementSystem.model.*;
+import com.mmtorresoptical.OpticalClinicManagementSystem.repository.*;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.AuthenticatedUserService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.auditlog.AuditLogService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.auditlog.resources.TransactionAuditHelper;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.helper.JSONService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.helper.VisitManagerService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.specification.TransactionSpecification;
+import com.mmtorresoptical.OpticalClinicManagementSystem.utils.UUIDUtils;
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.*;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.AgingReceivableDTO;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.YearMonth;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+public class TransactionService {
+
+    private final TransactionRepository transactionRepository;
+    private final TransactionItemRepository transactionItemRepository;
+    private final TransactionMapper transactionMapper;
+    private final AuthenticatedUserService authenticatedUserService;
+    private final PatientRepository patientRepository;
+    private final ProductRepository productRepository;
+    private final PrescriptionRepository prescriptionRepository;
+    private final TransactionItemMapper transactionItemMapper;
+    private final RefundItemRepository refundItemRepository;
+    private final RefundReceiptRepository refundReceiptRepository;
+    private final PaymentRepository paymentRepository;
+    private final TransactionAuditHelper transactionAuditHelper;
+    private final AuditLogService auditLogService;
+    private final PasswordEncoder passwordEncoder;
+    private final JSONService jsonService;
+    private final VisitManagerService visitManagerService;
+    private final ProductBatchService productBatchService;
+    private final ProductBatchRepository productBatchRepository;
+
+    @Transactional
+    public TransactionResponseDTO createTransaction(TransactionRequestDTO transactionRequestDTO) {
+        User authenticatedUser = authenticatedUserService.getCurrentUser();
+
+        Patient patient = null;
+
+        if (transactionRequestDTO.getPatientId() != null) {
+            UUID patientId = transactionRequestDTO.getPatientId();
+            patient = patientRepository.findById(patientId)
+                    .orElseThrow(() -> new ResourceNotFoundException("Patient not found with id: " + patientId));
+
+            if (transactionRequestDTO.getPrescriptionId() == null) {
+                // Patient but no linked prescription → immediate fulfillment, no pickup date
+                transactionRequestDTO.setEstimatedReadyDate(null);
+            }
+        } else {
+            // Walk-in retail: force estimated ready date to null
+            transactionRequestDTO.setEstimatedReadyDate(null);
+        }
+
+        Transaction transaction = transactionMapper.requestDTOtoEntity(transactionRequestDTO);
+
+        transaction.setUser(authenticatedUser);
+        transaction.setPatient(patient);
+
+        // Link prescription if provided — order remains in lab workflow (PENDING_LAB)
+        if (transactionRequestDTO.getPrescriptionId() != null) {
+            Prescription prescription = prescriptionRepository.findById(transactionRequestDTO.getPrescriptionId())
+                    .orElseThrow(() -> new ResourceNotFoundException(
+                            "Prescription not found with id: " + transactionRequestDTO.getPrescriptionId()));
+            if (patient == null || !prescription.getPatient().getPatientId().equals(patient.getPatientId())
+                    || prescription.getStatus() != PrescriptionStatus.ACTIVE
+                    || Boolean.TRUE.equals(prescription.getIsArchived())) {
+                throw new BadRequestException("Select an active prescription for the selected patient.");
+            }
+            transaction.setPrescription(prescription);
+        }
+
+        // Patient without a linked prescription: hand over items immediately
+        if (patient != null && transactionRequestDTO.getPrescriptionId() == null) {
+            transaction.setFulfillmentStatus(FulfillmentStatus.COMPLETED);
+            transaction.setCompletedAt(LocalDateTime.now());
+        }
+
+        boolean hasSeniorPwd = transactionRequestDTO.getSeniorPwdName() != null
+                && !transactionRequestDTO.getSeniorPwdName().isBlank();
+
+        // Track FEFO batch allocations per transaction item (committed after flush)
+        record PendingAllocation(TransactionItem item, List<ProductBatchService.BatchAllocation> allocations) {}
+        List<PendingAllocation> pendingAllocations = new ArrayList<>();
+        Map<Long, Integer> reservedByBatch = new HashMap<>();
+
+        List<TransactionItem> transactionItems = new ArrayList<>();
+        for (var dto : transactionRequestDTO.getItems()) {
+
+                    Product retrievedProduct = productRepository.findById(dto.getProductId())
+                            .orElseThrow(() -> new ResourceNotFoundException("Product not found with id: " + dto.getProductId()));
+
+                    if (Boolean.TRUE.equals(retrievedProduct.getIsArchived())) {
+                        throw new BadRequestException(
+                                "Cannot sell archived product: " + retrievedProduct.getProductName()
+                        );
+                    }
+
+                    // FEFO allocation check for PHYSICAL products (commit happens after flush)
+                    List<ProductBatchService.BatchAllocation> allocations = null;
+                    if (retrievedProduct.getProductType() == ProductType.PHYSICAL) {
+                        allocations = productBatchService.allocateFefo(
+                                retrievedProduct.getProductId(), dto.getQuantity(), reservedByBatch);
+                    }
+
+                    TransactionItem transactionItem = transactionItemMapper.requestDTOtoEntity(dto);
+
+                    transactionItem.setProduct(retrievedProduct);
+                    transactionItem.setTransaction(transaction);
+
+                    transactionItem.setUnitPrice(retrievedProduct.getUnitPrice());
+
+                    BigDecimal baseAmount =
+                            retrievedProduct.getUnitPrice().multiply(BigDecimal.valueOf(dto.getQuantity()));
+
+                    BigDecimal discountAmount = BigDecimal.ZERO;
+                    BigDecimal seniorPwdAmountForItem = BigDecimal.ZERO;
+
+                    // Senior/PWD discount: server-side re-compute to prevent tampering
+                    if (hasSeniorPwd && Boolean.TRUE.equals(retrievedProduct.getIsSeniorPwdEligible())) {
+                        BigDecimal seniorPerUnit = retrievedProduct.getUnitPrice()
+                                .multiply(new BigDecimal("0.20"))
+                                .setScale(2, RoundingMode.HALF_UP);
+                        BigDecimal seniorTotal = seniorPerUnit
+                                .multiply(BigDecimal.valueOf(dto.getQuantity()));
+
+                        // Incoming manual discount (if any)
+                        BigDecimal manualDiscount = BigDecimal.ZERO;
+                        if (dto.getDiscountType() != null && dto.getDiscountValue() != null) {
+                            manualDiscount = switch (dto.getDiscountType()) {
+                                case PERCENT -> baseAmount.multiply(dto.getDiscountValue())
+                                        .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
+                                case FIXED -> dto.getDiscountValue();
+                            };
+                        }
+
+                        if (seniorTotal.compareTo(manualDiscount) >= 0) {
+                            discountAmount = seniorTotal;
+                            seniorPwdAmountForItem = seniorTotal;
+                            transactionItem.setDiscountType(DiscountType.PERCENT);
+                            transactionItem.setDiscountValue(new BigDecimal("20"));
+                        } else {
+                            discountAmount = manualDiscount;
+                            seniorPwdAmountForItem = BigDecimal.ZERO;
+                        }
+                    } else {
+                        // No senior/PWD active or item not eligible — use incoming discount as-is
+                        if (dto.getDiscountType() != null && dto.getDiscountValue() != null) {
+                            discountAmount = switch (dto.getDiscountType()) {
+                                case PERCENT -> baseAmount.multiply(dto.getDiscountValue())
+                                        .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
+                                case FIXED -> dto.getDiscountValue();
+                            };
+                        }
+                    }
+
+                    transactionItem.setSubtotal(baseAmount.subtract(discountAmount));
+                    transactionItem.setSeniorPwdDiscountAmount(seniorPwdAmountForItem);
+
+                    transactionItems.add(transactionItem);
+                    if (allocations != null) {
+                        pendingAllocations.add(new PendingAllocation(transactionItem, allocations));
+                    }
+                }
+
+        BigDecimal total = transactionItems
+                .stream()
+                .map(TransactionItem::getSubtotal)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        transaction.setTotalAmount(total);
+        transaction.setTransactionItems(transactionItems);
+        transaction.setTransactionNumber(generateTransactionNumber());
+
+        // Persist Senior/PWD identification metadata
+        if (hasSeniorPwd) {
+            transaction.setSeniorPwdName(transactionRequestDTO.getSeniorPwdName());
+            transaction.setSeniorPwdAddress(transactionRequestDTO.getSeniorPwdAddress());
+            transaction.setSeniorPwdIdNumber(transactionRequestDTO.getSeniorPwdIdNumber());
+            transaction.setSeniorPwdType(transactionRequestDTO.getSeniorPwdType());
+            transaction.setIsSeniorPwdApplied(true);
+        }
+
+        BigDecimal amountTendered = transactionRequestDTO.getAmountTendered();
+        if (amountTendered == null) {
+            amountTendered = BigDecimal.ZERO;
+        }
+        if (amountTendered.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new BadRequestException("At least a deposit payment is required to create a transaction.");
+        }
+
+        if (amountTendered.compareTo(total) < 0) {
+            if (patient == null) {
+                throw new BadRequestException("Deposits require a linked patient.");
+            }
+            if (transaction.getPrescription() == null) {
+                throw new BadRequestException("Deposits require an active prescription for the linked patient.");
+            }
+            BigDecimal minDeposit = total.multiply(new BigDecimal("0.50")).setScale(2, RoundingMode.HALF_UP);
+            if (amountTendered.compareTo(minDeposit) < 0) {
+                throw new BadRequestException(
+                        "Deposit must be at least 50% of the total. Minimum required: ₱" + minDeposit);
+            }
+        }
+
+        PaymentMethod paymentMethod = transactionRequestDTO.getPaymentMethod() != null
+                ? transactionRequestDTO.getPaymentMethod()
+                : PaymentMethod.CASH;
+
+        if (paymentMethod == PaymentMethod.GCASH && amountTendered.compareTo(total) > 0) {
+            amountTendered = total;
+        }
+
+        BigDecimal amountPaid = amountTendered.min(total);
+        transaction.setAmountPaid(amountPaid);
+        transaction.setTransactionStatus(computeStatus(total, amountPaid));
+
+        if (patient == null && transaction.getTransactionStatus() == TransactionStatus.PAID) {
+            transaction.setFulfillmentStatus(FulfillmentStatus.COMPLETED);
+            transaction.setCompletedAt(LocalDateTime.now());
+        }
+
+        Transaction savedTransaction = transactionRepository.saveAndFlush(transaction);
+
+        // Commit FEFO batch allocations now that transaction items have IDs
+        for (PendingAllocation pending : pendingAllocations) {
+            productBatchService.commitAllocation(pending.item(), pending.allocations());
+        }
+
+        // Create initial payment record if money was tendered
+        if (amountTendered.compareTo(BigDecimal.ZERO) > 0) {
+            Payment payment = new Payment();
+            payment.setTransaction(savedTransaction);
+            payment.setAmount(amountTendered);
+            payment.setPaymentMethod(paymentMethod);
+            payment.setGcashNumber(transactionRequestDTO.getGcashNumber());
+            payment.setReferenceNumber(transactionRequestDTO.getReferenceNumber());
+            Payment savedPayment = paymentRepository.save(payment);
+            if (savedTransaction.getPayments() == null) {
+                savedTransaction.setPayments(new java.util.ArrayList<>());
+            }
+            savedTransaction.getPayments().add(savedPayment);
+        }
+
+        transactionAuditHelper.logCreate(savedTransaction);
+
+        if (patient != null) {
+            visitManagerService.linkToLatestOrCreateVisit(patient, "Transaction");
+        }
+
+        TransactionResponseDTO response = enrichWithPayments(transactionMapper.entityToResponseDTO(savedTransaction));
+        BigDecimal change = amountTendered.subtract(amountPaid);
+        response.setChange(change);
+        return response;
+    }
+
+    @Transactional
+    public PaymentResponseDTO addPayment(UUID transactionId, PaymentRequestDTO request) {
+        Transaction transaction = transactionRepository.findById(transactionId)
+                .orElseThrow(() -> new ResourceNotFoundException("Transaction not found with id: " + transactionId));
+
+        if (transaction.getTransactionStatus() == TransactionStatus.VOIDED) {
+            throw new IllegalStateException("Cannot add payment to a voided transaction");
+        }
+
+        if (transaction.getRefundStatus() == RefundStatus.FULL) {
+            throw new IllegalStateException("Cannot add payment to a fully refunded transaction");
+        }
+
+        BigDecimal remaining = transaction.getBalanceDue();
+
+        if (request.getAmount().compareTo(remaining) != 0) {
+            throw new BadRequestException(
+                    "Partial balance collection is restricted. The remaining balance of ₱"
+                            + remaining.setScale(2, RoundingMode.HALF_UP)
+                            + " must be settled in full.");
+        }
+
+        Payment payment = new Payment();
+        payment.setTransaction(transaction);
+        payment.setAmount(request.getAmount());
+        payment.setPaymentMethod(request.getPaymentMethod());
+        payment.setGcashNumber(request.getGcashNumber());
+        payment.setReferenceNumber(request.getReferenceNumber());
+        paymentRepository.save(payment);
+
+        BigDecimal newAmountPaid = transaction.getAmountPaid().add(request.getAmount());
+        transaction.setAmountPaid(newAmountPaid);
+        transaction.setTransactionStatus(computeStatus(transaction.getNetOrderTotal(), transaction.getNetAmountPaid()));
+        transactionRepository.save(transaction);
+
+        transactionAuditHelper.logPayment(transaction);
+
+        PaymentResponseDTO response = new PaymentResponseDTO();
+        response.setId(payment.getId());
+        response.setAmount(payment.getAmount());
+        response.setPaymentMethod(payment.getPaymentMethod().name());
+        response.setGcashNumber(payment.getGcashNumber());
+        response.setReferenceNumber(payment.getReferenceNumber());
+        response.setCreatedAt(payment.getCreatedAt());
+        return response;
+    }
+
+    @Transactional
+    public TransactionResponseDTO updateFulfillmentStatus(UUID transactionId, FulfillmentStatusUpdateDTO request) {
+        Transaction transaction = transactionRepository.findById(transactionId)
+                .orElseThrow(() -> new ResourceNotFoundException("Transaction not found with id: " + transactionId));
+
+        FulfillmentStatus currentStatus = transaction.getFulfillmentStatus();
+        FulfillmentStatus requestedStatus = request.getFulfillmentStatus();
+
+        if (requestedStatus == currentStatus) {
+            throw new BadRequestException("Transaction is already in " + currentStatus.name() + " fulfillment status.");
+        }
+
+        if (requestedStatus == FulfillmentStatus.FOR_PICKUP && currentStatus != FulfillmentStatus.PENDING_LAB) {
+            throw new BadRequestException("Can only mark as For Pickup from Pending Lab status. Current: " + currentStatus.name());
+        }
+
+        if (requestedStatus == FulfillmentStatus.COMPLETED && currentStatus != FulfillmentStatus.FOR_PICKUP) {
+            throw new BadRequestException("Can only mark as Completed from Ready for Pickup status. Current: " + currentStatus.name());
+        }
+
+        // Can't go backward
+        if ((requestedStatus == FulfillmentStatus.PENDING_LAB && currentStatus != FulfillmentStatus.PENDING_LAB)) {
+            throw new BadRequestException("Cannot revert fulfillment status back to Pending Lab from " + currentStatus.name());
+        }
+
+        if (requestedStatus == FulfillmentStatus.COMPLETED && transaction.getTransactionStatus() != TransactionStatus.PAID) {
+            throw new BadRequestException("Cannot mark as picked up until the transaction is fully paid.");
+        }
+
+        transaction.setFulfillmentStatus(requestedStatus);
+
+        if (requestedStatus == FulfillmentStatus.COMPLETED) {
+            transaction.setCompletedAt(LocalDateTime.now());
+        }
+
+        Transaction saved = transactionRepository.save(transaction);
+
+        if (requestedStatus == FulfillmentStatus.FOR_PICKUP) {
+            transactionAuditHelper.logReadyForPickup(saved);
+        } else {
+            transactionAuditHelper.logComplete(saved);
+        }
+
+        TransactionResponseDTO response = enrichWithPayments(transactionMapper.entityToResponseDTO(saved));
+        BigDecimal totalPayments = response.getPayments() != null
+                ? response.getPayments().stream()
+                    .map(PaymentResponseDTO::getAmount)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add)
+                : BigDecimal.ZERO;
+        BigDecimal change = totalPayments.subtract(saved.getTotalAmount()).max(BigDecimal.ZERO);
+        response.setChange(change);
+        return response;
+    }
+
+    public List<PaymentResponseDTO> getPaymentsForTransaction(UUID transactionId) {
+        return paymentRepository.findByTransactionTransactionIdOrderByCreatedAtDesc(transactionId)
+                .stream().map(p -> {
+                    PaymentResponseDTO dto = new PaymentResponseDTO();
+                    dto.setId(p.getId());
+                    dto.setAmount(p.getAmount());
+                    dto.setPaymentMethod(p.getPaymentMethod().name());
+                    dto.setGcashNumber(p.getGcashNumber());
+                    dto.setReferenceNumber(p.getReferenceNumber());
+                    dto.setCreatedAt(p.getCreatedAt());
+                    return dto;
+                }).collect(Collectors.toList());
+    }
+
+    public Page<TransactionListDTO> getAllTransactions(
+            String keyword,
+            LocalDate minDate,
+            LocalDate maxDate,
+            TransactionStatus status,
+            RefundStatus refundStatus,
+            FulfillmentStatus fulfillmentStatus,
+            UUID productId,
+            int page,
+            int size,
+            String sortBy,
+            String sortOrder
+    ) {
+
+        if (keyword != null && UUIDUtils.isUUID(keyword)) {
+            Optional<Transaction> transaction =
+                    transactionRepository.findById(UUID.fromString(keyword));
+
+            if (transaction.isEmpty()) {
+                return Page.empty();
+            }
+
+            return new PageImpl<>(
+                    List.of(transactionMapper.entityToListDTO(transaction.get())),
+                    PageRequest.of(page, size),
+                    1
+            );
+        }
+
+        Sort.Direction direction;
+        try {
+            direction = Sort.Direction.fromString(sortOrder);
+        } catch (IllegalArgumentException ex) {
+            direction = Sort.Direction.DESC;
+        }
+
+        Specification<Transaction> spec = Specification.allOf();
+
+        if (keyword != null && !keyword.isBlank()) {
+            spec = spec.and(TransactionSpecification.hasKeyword(keyword));
+        }
+
+        if (minDate != null || maxDate != null) {
+            spec = spec.and(
+                    TransactionSpecification.dateBetween(minDate, maxDate)
+            );
+        }
+
+        if (status != null) {
+            spec = spec.and(TransactionSpecification.hasTransactionStatus(status));
+        }
+
+        if (refundStatus != null) {
+            spec = spec.and(TransactionSpecification.hasRefundStatus(refundStatus));
+        }
+
+        if (fulfillmentStatus != null) {
+            spec = spec.and(TransactionSpecification.hasFulfillmentStatus(fulfillmentStatus));
+        }
+
+        if (productId != null) {
+            spec = spec.and(TransactionSpecification.hasProductId(productId));
+        }
+
+        Pageable pageable = PageRequest.of(page, size, Sort.by(direction, sortBy));
+
+        Page<Transaction> transactions = transactionRepository.findAll(spec, pageable);
+
+        return transactions.map(transactionMapper::entityToListDTO);
+    }
+
+    @Transactional(readOnly = true)
+    public TransactionDetailsDTO getTransaction(UUID id) {
+        Transaction transaction = transactionRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Transaction not found with id: " + id));
+
+        TransactionDetailsDTO dto = transactionMapper.entityToDetailsDTO(transaction);
+
+        List<PaymentResponseDTO> paymentDTOs = paymentRepository
+                .findByTransactionTransactionIdOrderByCreatedAtDesc(id)
+                .stream().map(p -> {
+                    PaymentResponseDTO pd = new PaymentResponseDTO();
+                    pd.setId(p.getId());
+                    pd.setAmount(p.getAmount());
+                    pd.setPaymentMethod(p.getPaymentMethod().name());
+                    pd.setGcashNumber(p.getGcashNumber());
+                    pd.setReferenceNumber(p.getReferenceNumber());
+                    pd.setCreatedAt(p.getCreatedAt());
+                    return pd;
+                }).collect(Collectors.toList());
+        dto.setPayments(paymentDTOs);
+
+        BigDecimal totalPayments = paymentDTOs.stream()
+                .map(PaymentResponseDTO::getAmount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal change = totalPayments.subtract(transaction.getTotalAmount()).max(BigDecimal.ZERO);
+        dto.setChange(change);
+
+        return dto;
+    }
+
+    public List<Transaction> getTransactionsForReport(
+            LocalDate minDate,
+            LocalDate maxDate
+    ) {
+        Specification<Transaction> spec = Specification.allOf();
+
+        if (minDate != null || maxDate != null) {
+            spec = spec.and(
+                    TransactionSpecification.dateBetween(minDate, maxDate)
+            );
+        }
+
+        Sort sort = Sort.by(Sort.Direction.DESC, "transactionDate");
+        return transactionRepository.findAll(spec, sort);
+    }
+
+    public TransactionMetricsDTO getTransactionMetrics() {
+
+        long totalTransactions = transactionRepository.countByTransactionStatusNot(TransactionStatus.VOIDED);
+
+        // All-time gross revenue (cash-basis): PAID totalAmount + DEPOSIT amountPaid
+        BigDecimal allTimePaidRevenue = transactionRepository.sumTotalAmountByTransactionStatusAndDateBetween(
+                TransactionStatus.PAID, LocalDateTime.of(2000, 1, 1, 0, 0), LocalDateTime.now().plusDays(1));
+        BigDecimal allTimeDepositRevenue = transactionRepository.sumAmountPaidByTransactionStatusAndDateBetween(
+                TransactionStatus.DEPOSIT, LocalDateTime.of(2000, 1, 1, 0, 0), LocalDateTime.now().plusDays(1));
+        BigDecimal grossRevenue = allTimePaidRevenue.add(allTimeDepositRevenue);
+        BigDecimal totalRefundedAmount = refundReceiptRepository.sumTotalRefundAmount();
+        BigDecimal totalRevenue = grossRevenue.subtract(totalRefundedAmount);
+
+        LocalDateTime startOfToday = LocalDate.now().atStartOfDay();
+        LocalDateTime startOfTomorrow = startOfToday.plusDays(1);
+
+        long todayTransactions = transactionRepository.countByTransactionStatusNotAndTransactionDateBetween(TransactionStatus.VOIDED, startOfToday, startOfTomorrow);
+
+        // Today's gross revenue (cash-basis): PAID totalAmount + DEPOSIT amountPaid
+        BigDecimal todayPaidRevenue = transactionRepository.sumTotalAmountByTransactionStatusAndDateBetween(
+                TransactionStatus.PAID, startOfToday, startOfTomorrow);
+        BigDecimal todayDepositRevenue = transactionRepository.sumAmountPaidByTransactionStatusAndDateBetween(
+                TransactionStatus.DEPOSIT, startOfToday, startOfTomorrow);
+        BigDecimal todayGrossRevenue = todayPaidRevenue.add(todayDepositRevenue);
+        BigDecimal todayTotalRefundedAmount = refundReceiptRepository.sumRefundAmountByCreatedAtBetween(startOfToday, startOfTomorrow);
+        BigDecimal todayRevenue = todayGrossRevenue.subtract(todayTotalRefundedAmount);
+
+        BigDecimal averageTransactionValue = totalTransactions > 0
+                ? totalRevenue.divide(BigDecimal.valueOf(totalTransactions), 2, RoundingMode.HALF_UP)
+                : BigDecimal.ZERO;
+
+        LocalDate today = LocalDate.now();
+        LocalDateTime startOfMonth = today.withDayOfMonth(1).atStartOfDay();
+        LocalDateTime startOfNextMonth = startOfMonth.plusMonths(1);
+
+        long totalTransactionsThisMonth = transactionRepository.countByTransactionStatusNotAndTransactionDateBetween(TransactionStatus.VOIDED, startOfMonth, startOfNextMonth);
+
+        // Monthly gross revenue (cash-basis): PAID totalAmount + DEPOSIT amountPaid
+        BigDecimal monthlyPaidRevenue = transactionRepository.sumTotalAmountByTransactionStatusAndDateBetween(
+                TransactionStatus.PAID, startOfMonth, startOfNextMonth);
+        BigDecimal monthlyDepositRevenue = transactionRepository.sumAmountPaidByTransactionStatusAndDateBetween(
+                TransactionStatus.DEPOSIT, startOfMonth, startOfNextMonth);
+        BigDecimal monthlyGrossRevenue = monthlyPaidRevenue.add(monthlyDepositRevenue);
+
+        BigDecimal totalRefundedAmountThisMonth = refundReceiptRepository.sumRefundAmountByCreatedAtBetween(startOfMonth, startOfNextMonth);
+        BigDecimal monthlyNetRevenue = monthlyGrossRevenue.subtract(totalRefundedAmountThisMonth);
+
+        BigDecimal todayTotalVoidedAmount = transactionRepository.sumVoidedAmountByTransactionDateBetween(startOfToday, startOfTomorrow);
+
+        BigDecimal totalAccountsReceivable = transactionRepository.sumBalanceDueByTransactionStatusPartiallyPaid();
+
+        long awaitingPickupCount = transactionRepository.countByFulfillmentStatus(FulfillmentStatus.FOR_PICKUP);
+
+        long depositsPendingCount = transactionRepository.countByTransactionStatus(TransactionStatus.DEPOSIT);
+
+        return TransactionMetricsDTO.builder()
+                .totalTransactions(totalTransactions)
+                .totalRevenue(totalRevenue)
+                .todayRevenue(todayRevenue)
+                .todayTransactions(todayTransactions)
+                .averageTransactionValue(averageTransactionValue)
+                .totalTransactionsThisMonth(totalTransactionsThisMonth)
+                .monthlyNetRevenue(monthlyNetRevenue)
+                .totalRefundedAmount(totalRefundedAmount)
+                .todayTotalRefundedAmount(todayTotalRefundedAmount)
+                .totalRefundedAmountThisMonth(totalRefundedAmountThisMonth)
+                .todayTotalVoidedAmount(todayTotalVoidedAmount)
+                .totalAccountsReceivable(totalAccountsReceivable)
+                .awaitingPickupCount(awaitingPickupCount)
+                .depositsPendingCount(depositsPendingCount)
+                .build();
+    }
+
+    public List<DailyCashInflowPoint> getDailyCashInflow() {
+        YearMonth thisMonth = YearMonth.now();
+        LocalDateTime startOfMonth = thisMonth.atDay(1).atStartOfDay();
+        LocalDateTime startOfNextMonth = thisMonth.plusMonths(1).atDay(1).atStartOfDay();
+
+        // Cash-basis: PAID totalAmount + DEPOSIT amountPaid
+        List<Object[]> paidRows = transactionRepository.sumTotalAmountByStatusGroupedByDay(
+                TransactionStatus.PAID, startOfMonth, startOfNextMonth);
+        List<Object[]> depositRows = transactionRepository.sumAmountPaidByStatusGroupedByDay(
+                TransactionStatus.DEPOSIT, startOfMonth, startOfNextMonth);
+        List<Object[]> refundRows = refundReceiptRepository.sumRefundsGroupedByDay(
+                startOfMonth, startOfNextMonth);
+
+        Map<Integer, BigDecimal> dailyMap = new LinkedHashMap<>();
+        int daysInMonth = thisMonth.lengthOfMonth();
+        for (int d = 1; d <= daysInMonth; d++) {
+            dailyMap.put(d, BigDecimal.ZERO);
+        }
+
+        for (Object[] row : paidRows) {
+            java.sql.Date sqlDate = (java.sql.Date) row[0];
+            int day = sqlDate.toLocalDate().getDayOfMonth();
+            BigDecimal gross = (BigDecimal) row[1];
+            dailyMap.merge(day, gross, BigDecimal::add);
+        }
+
+        for (Object[] row : depositRows) {
+            java.sql.Date sqlDate = (java.sql.Date) row[0];
+            int day = sqlDate.toLocalDate().getDayOfMonth();
+            BigDecimal deposit = (BigDecimal) row[1];
+            dailyMap.merge(day, deposit, BigDecimal::add);
+        }
+
+        for (Object[] row : refundRows) {
+            java.sql.Date sqlDate = (java.sql.Date) row[0];
+            int day = sqlDate.toLocalDate().getDayOfMonth();
+            BigDecimal refund = (BigDecimal) row[1];
+            dailyMap.merge(day, refund.negate(), BigDecimal::add);
+        }
+
+        List<DailyCashInflowPoint> result = new ArrayList<>();
+        for (Map.Entry<Integer, BigDecimal> entry : dailyMap.entrySet()) {
+            result.add(new DailyCashInflowPoint(entry.getKey(), entry.getValue()));
+        }
+        return result;
+    }
+
+    public List<AgingReceivableDTO> getAgingAccountsReceivable() {
+        LocalDateTime cutoffDate = LocalDate.now().minusDays(14).atStartOfDay();
+        List<Transaction> transactions = transactionRepository.findAgingAccountsReceivable(cutoffDate);
+
+        LocalDate today = LocalDate.now();
+        return transactions.stream().map(t -> {
+            String customerName = t.getPatient() != null
+                    ? t.getPatient().getFirstName() + " " + t.getPatient().getLastName()
+                    : "Walk-in";
+
+            long daysOutstanding = ChronoUnit.DAYS.between(t.getTransactionDate().toLocalDate(), today);
+
+            return AgingReceivableDTO.builder()
+                    .transactionId(t.getTransactionId().toString())
+                    .transactionNumber(t.getTransactionNumber())
+                    .transactionDate(t.getTransactionDate().toLocalDate())
+                    .customerName(customerName)
+                    .totalAmount(t.getTotalAmount())
+                    .amountPaid(t.getAmountPaid())
+                    .balanceDue(t.getBalanceDue())
+                    .daysOutstanding(daysOutstanding)
+                    .build();
+        }).collect(Collectors.toList());
+    }
+
+    @Transactional
+    public void voidTransaction(UUID transactionId, VoidTransactionRequestDTO voidTransactionRequestDTO) {
+
+        Transaction transaction = transactionRepository.findById(transactionId)
+                .orElseThrow(() -> new ResourceNotFoundException("Transaction not found with id: " + transactionId));
+
+        User authenticatedUser = authenticatedUserService.getCurrentUser();
+
+        if (!passwordEncoder.matches(voidTransactionRequestDTO.getPassword(), authenticatedUser.getPasswordHash())) {
+            throw new BadRequestException("Invalid password");
+        }
+
+        if (transaction.getTransactionStatus() == TransactionStatus.VOIDED) {
+            throw new IllegalStateException("Transaction already voided");
+        }
+
+        if (transaction.getFulfillmentStatus() == FulfillmentStatus.FOR_PICKUP) {
+            throw new IllegalStateException("Cannot void a transaction where items have been marked as ready for pickup. Please process a refund instead.");
+        }
+
+        if (transaction.getRefundStatus() == RefundStatus.FULL) {
+            throw new IllegalStateException("Cannot void a fully refunded transaction");
+        }
+
+        if (transaction.getRefundStatus() == RefundStatus.PARTIAL) {
+            throw new IllegalStateException("Cannot void a partially refunded transaction");
+        }
+
+        // Restore stock only for PHYSICAL products
+        for (TransactionItem item : transaction.getTransactionItems()) {
+            Product product = item.getProduct();
+            if (product.getProductType() == ProductType.PHYSICAL) {
+                productBatchService.restoreForVoid(item);
+            }
+        }
+
+        transaction.setTransactionStatus(TransactionStatus.VOIDED);
+        transaction.setFulfillmentStatus(FulfillmentStatus.COMPLETED);
+        transaction.setVoidedBy(authenticatedUser);
+        transaction.setVoidedAt(LocalDateTime.now());
+        transaction.setVoidReason(voidTransactionRequestDTO.getReason());
+
+        transactionAuditHelper.logVoid(transaction);
+    }
+
+    @Transactional
+    public ItemRefundResponseDTO refundTransaction(
+            RefundTransactionRequestDTO request
+    ) {
+        if (request.getItems() == null || request.getItems().isEmpty()) {
+            throw new BadRequestException("At least one item is required for refund.");
+        }
+
+        User currentUser = authenticatedUserService.getCurrentUser();
+
+        // ── Phase 1: Validate all items, calculate refund amounts, sum totalRefundValue ──
+        List<RefundItem> pendingItems = new ArrayList<>();
+        List<TransactionItem> refundItems = new ArrayList<>();
+        Transaction transaction = null;
+        BigDecimal totalRefundValue = BigDecimal.ZERO;
+        Map<UUID, List<RefundBatchAllocationDTO>> batchTargetMap = new HashMap<>();
+        Set<UUID> selectedItems = new HashSet<>();
+
+        for (RefundItemDTO dto : request.getItems()) {
+            if (!selectedItems.add(dto.getTransactionItemId())) {
+                throw new BadRequestException("Select each transaction item only once per refund.");
+            }
+            TransactionItem item = transactionItemRepository.findById(dto.getTransactionItemId())
+                    .orElseThrow(() -> new ResourceNotFoundException(
+                            "Transaction item not found: " + dto.getTransactionItemId()));
+
+            if (transaction == null) {
+                transaction = item.getTransaction();
+            } else if (!transaction.getTransactionId().equals(item.getTransaction().getTransactionId())) {
+                throw new BadRequestException("All refund items must belong to the same transaction.");
+            }
+
+            refundItems.add(item);
+
+            if (dto.getBatchAllocations() != null && !dto.getBatchAllocations().isEmpty()) {
+                batchTargetMap.put(dto.getTransactionItemId(), dto.getBatchAllocations());
+            }
+
+            if (transaction.getTransactionStatus() == TransactionStatus.VOIDED) {
+                throw new IllegalStateException("Cannot refund a voided transaction.");
+            }
+
+            if (transaction.getRefundStatus() == RefundStatus.FULL) {
+                throw new IllegalStateException("Transaction is already fully refunded.");
+            }
+
+            int alreadyRefunded = item.getRefundedQuantity() == null ? 0 : item.getRefundedQuantity();
+            int newRefundQty = dto.getRefundQuantity();
+
+            if (alreadyRefunded + newRefundQty > item.getQuantity()) {
+                throw new BadRequestException(
+                        "Refund exceeds purchased quantity for: " + item.getProduct().getProductName());
+            }
+
+            // Use cumulative credits so split returns match a single return.
+            BigDecimal purchasedQuantity = BigDecimal.valueOf(item.getQuantity());
+            BigDecimal cumulativeCredit = item.getSubtotal()
+                    .multiply(BigDecimal.valueOf(alreadyRefunded + newRefundQty))
+                    .divide(purchasedQuantity, 2, RoundingMode.HALF_UP);
+            BigDecimal priorCredit = item.getSubtotal().multiply(BigDecimal.valueOf(alreadyRefunded))
+                    .divide(purchasedQuantity, 2, RoundingMode.HALF_UP);
+            BigDecimal itemCredit = cumulativeCredit.subtract(priorCredit);
+
+            totalRefundValue = totalRefundValue.add(itemCredit);
+
+            RefundItem refundItem = new RefundItem();
+            refundItem.setItemCreditAmount(itemCredit);
+            refundItem.setTransactionItem(item);
+            refundItem.setQuantityRefunded(newRefundQty);
+
+            // Derive item-level reason from batch allocations if present
+            List<RefundBatchAllocationDTO> itemBatchTargets = batchTargetMap.get(dto.getTransactionItemId());
+            if (itemBatchTargets != null && !itemBatchTargets.isEmpty()) {
+                String derivedReason = itemBatchTargets.stream()
+                        .map(RefundBatchAllocationDTO::getRefundReason)
+                        .filter(r -> r != null && !r.isBlank())
+                        .distinct()
+                        .reduce((a, b) -> a) // single reason if uniform
+                        .orElse(dto.getRefundReason() != null ? dto.getRefundReason() : "");
+                refundItem.setRefundReason(derivedReason);
+            } else {
+                refundItem.setRefundReason(dto.getRefundReason());
+            }
+
+            pendingItems.add(refundItem);
+        }
+
+        BigDecimal originalTotal = transaction.getTotalAmount();
+        BigDecimal newOrderTotal = transaction.getNetOrderTotal().subtract(totalRefundValue).max(BigDecimal.ZERO);
+        BigDecimal amountPaid = transaction.getAmountPaid();
+        TransactionStatus previousStatus = transaction.getTransactionStatus();
+        FulfillmentStatus previousFulfillmentStatus = transaction.getFulfillmentStatus();
+        RefundStatus previousRefundStatus = transaction.getRefundStatus();
+
+        BigDecimal netPaidBeforeRefund = transaction.getNetAmountPaid();
+        BigDecimal cashToReturn = netPaidBeforeRefund.subtract(newOrderTotal).max(BigDecimal.ZERO);
+        BigDecimal effectivePaid = netPaidBeforeRefund.subtract(cashToReturn);
+        transaction.setTotalRefundedCash(amountPaid.subtract(effectivePaid));
+        transaction.setTransactionStatus(computeStatus(newOrderTotal, effectivePaid));
+
+        // Determine batch-level refund method and actual cashback
+        String batchRefundMethod;
+        BigDecimal batchActualCashback;
+        if (cashToReturn.compareTo(BigDecimal.ZERO) == 0) {
+            batchRefundMethod = "BALANCE_ADJUSTMENT";
+            batchActualCashback = BigDecimal.ZERO;
+        } else {
+            batchRefundMethod = request.getRefundMethod();
+            batchActualCashback = cashToReturn;
+        }
+
+        // ── Phase 3: Status & inventory updates ──
+        boolean allItemsFullyRefunded = true;
+        for (TransactionItem ti : transaction.getTransactionItems()) {
+            int tiAlreadyRefunded = ti.getRefundedQuantity() == null ? 0 : ti.getRefundedQuantity();
+            int tiNewRefunded = tiAlreadyRefunded;
+            for (RefundItem pending : pendingItems) {
+                if (pending.getTransactionItem().getTransactionItemId().equals(ti.getTransactionItemId())) {
+                    tiNewRefunded += pending.getQuantityRefunded();
+                }
+            }
+            if (tiNewRefunded < ti.getQuantity()) {
+                allItemsFullyRefunded = false;
+                break;
+            }
+        }
+
+        if (allItemsFullyRefunded) {
+            transaction.setRefundStatus(RefundStatus.FULL);
+            transaction.setFulfillmentStatus(FulfillmentStatus.COMPLETED);
+        } else {
+            transaction.setRefundStatus(RefundStatus.PARTIAL);
+        }
+
+        RefundReceipt receipt = new RefundReceipt();
+        receipt.setReceiptNumber(generateRefundReceiptNumber());
+        receipt.setTransaction(transaction);
+        receipt.setActualCashback(batchActualCashback);
+        receipt.setRefundMethod(batchRefundMethod);
+        receipt.setGcashNumber(request.getGcashNumber());
+        receipt.setReferenceNumber(request.getReferenceNumber());
+        receipt.setCreatedAt(LocalDateTime.now());
+        receipt.setIssuedBy(currentUser);
+
+        // Restore stock and build refund items linked to the receipt
+        List<ItemRefundResponseDTO.RefundedItemSummary> itemSummaries = new ArrayList<>();
+        for (RefundItem refundItem : pendingItems) {
+            TransactionItem item = refundItem.getTransactionItem();
+            Product product = item.getProduct();
+
+            if (product.getProductType() == ProductType.PHYSICAL) {
+                boolean isDamaged = "Damaged".equalsIgnoreCase(refundItem.getRefundReason());
+                List<RefundBatchAllocationDTO> batchTargets = batchTargetMap.get(item.getTransactionItemId());
+                if (batchTargets != null && !batchTargets.isEmpty()) {
+                    productBatchService.restoreForRefundToBatch(item, batchTargets, isDamaged);
+                    // Persist per-batch refund details for audit trail
+                    for (RefundBatchAllocationDTO target : batchTargets) {
+                        if (target.getQuantityToRestore() == null || target.getQuantityToRestore() <= 0) continue;
+                        RefundItemBatchDetail detail = new RefundItemBatchDetail();
+                        detail.setRefundItem(refundItem);
+                        detail.setProductBatch(productBatchRepository.getReferenceById(target.getProductBatchId()));
+                        detail.setQuantityRestored(target.getQuantityToRestore());
+                        refundItem.getBatchDetails().add(detail);
+                    }
+                } else {
+                    productBatchService.restoreForRefund(item, refundItem.getQuantityRefunded(), isDamaged);
+                }
+            }
+
+            refundItem.setRefundReceipt(receipt);
+            receipt.getRefundItems().add(refundItem);
+
+            int ar = item.getRefundedQuantity() == null ? 0 : item.getRefundedQuantity();
+            item.setRefundedQuantity(ar + refundItem.getQuantityRefunded());
+
+            itemSummaries.add(ItemRefundResponseDTO.RefundedItemSummary.builder()
+                    .productName(product.getProductName())
+                    .unitPrice(item.getUnitPrice())
+                    .refundQuantity(refundItem.getQuantityRefunded())
+                    .build());
+        }
+
+        refundReceiptRepository.save(receipt);
+        transactionRepository.save(transaction);
+
+        // ── Audit logging ──
+        int itemCount = pendingItems.stream().mapToInt(RefundItem::getQuantityRefunded).sum();
+        String productNames = refundItems.stream()
+                .map(i -> i.getProduct().getProductName())
+                .reduce((a, b) -> a + ", " + b).orElse("");
+
+        Map<String, Object> auditData = new LinkedHashMap<>();
+        auditData.put("transactionId", transaction.getTransactionId().toString());
+        auditData.put("transactionNumber", transaction.getTransactionNumber());
+        auditData.put("refundReceiptNumber", receipt.getReceiptNumber());
+        auditData.put("itemCount", itemCount);
+        auditData.put("products", productNames);
+        auditData.put("totalRefundValue", totalRefundValue);
+        auditData.put("refundMethod", batchRefundMethod);
+        auditData.put("beforeTotalAmount", originalTotal);
+        auditData.put("afterTotalAmount", newOrderTotal);
+        auditData.put("beforeAmountPaid", amountPaid);
+        auditData.put("afterAmountPaid", transaction.getAmountPaid());
+        auditData.put("totalRefundedCash", transaction.getTotalRefundedCash());
+        auditData.put("cashReturnedToPatient", cashToReturn);
+        auditData.put("beforeRefundStatus", previousRefundStatus != null
+                ? previousRefundStatus.name() : RefundStatus.NONE.name());
+        auditData.put("afterRefundStatus", transaction.getRefundStatus().name());
+        auditData.put("beforeTransactionStatus", previousStatus.name());
+        auditData.put("afterTransactionStatus", transaction.getTransactionStatus().name());
+
+        auditLogService.log(
+                com.mmtorresoptical.OpticalClinicManagementSystem.enums.ActionType.REFUND,
+                com.mmtorresoptical.OpticalClinicManagementSystem.enums.ResourceType.TRANSACTION,
+                transaction.getTransactionId(),
+                "Refunded " + itemCount + (itemCount == 1 ? " item" : " items"),
+                jsonService.toJson(auditData)
+        );
+
+        // ── Build response ──
+        BigDecimal newBalanceDue = newOrderTotal.subtract(effectivePaid).max(BigDecimal.ZERO);
+
+        return ItemRefundResponseDTO.builder()
+                .originalTotal(originalTotal)
+                .newOrderTotal(newOrderTotal)
+                .amountPaid(effectivePaid)
+                .cashToReturn(cashToReturn)
+                .newRemainingDue(newBalanceDue)
+                .newTransactionStatus(transaction.getTransactionStatus().name())
+                .newRefundStatus(transaction.getRefundStatus().name())
+                .refundReceipt(ItemRefundResponseDTO.RefundReceiptData.builder()
+                        .refundReceiptId(receipt.getRefundReceiptId())
+                        .receiptNumber(receipt.getReceiptNumber())
+                        .cashReturnedAmount(receipt.getActualCashback())
+                        .refundMethod(receipt.getRefundMethod())
+                        .gcashNumber(receipt.getGcashNumber())
+                        .referenceNumber(receipt.getReferenceNumber())
+                        .dateIssued(receipt.getCreatedAt())
+                        .issuedByFullName(currentUser.getFirstName() + " " + currentUser.getLastName())
+                        .build())
+                .refundedItems(itemSummaries)
+                .build();
+    }
+
+    private String generateTransactionNumber() {
+        String prefix = "TXN-" + LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMMdd")) + "-";
+        String maxNumber = transactionRepository.findMaxTransactionNumberByPrefix(prefix);
+        if (maxNumber == null) {
+            return prefix + "0001";
+        }
+        int seq = Integer.parseInt(maxNumber.substring(maxNumber.lastIndexOf('-') + 1));
+        return prefix + String.format("%04d", seq + 1);
+    }
+
+    private String generateRefundReceiptNumber() {
+        String prefix = "REF-" + LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMMdd")) + "-";
+        String maxNumber = refundReceiptRepository.findMaxReceiptNumberByPrefix(prefix);
+        if (maxNumber == null) {
+            return prefix + "0001";
+        }
+        int seq = Integer.parseInt(maxNumber.substring(maxNumber.lastIndexOf('-') + 1));
+        return prefix + String.format("%04d", seq + 1);
+    }
+
+    private void updateTransactionRefundStatus(
+            UUID transactionItemId
+    ) {
+
+        Transaction txn =
+                transactionItemRepository
+                        .findById(transactionItemId)
+                        .orElseThrow()
+                        .getTransaction();
+
+        boolean allRefunded =
+                txn.getTransactionItems().stream()
+                        .allMatch(i ->
+                                i.getRefundedQuantity() != null &&
+                                        i.getRefundedQuantity()
+                                                .equals(i.getQuantity())
+                        );
+
+        boolean anyRefunded =
+                txn.getTransactionItems().stream()
+                        .anyMatch(i ->
+                                i.getRefundedQuantity() != null &&
+                                        i.getRefundedQuantity() > 0
+                        );
+
+        if (allRefunded) {
+            txn.setRefundStatus(
+                    RefundStatus.FULL
+            );
+        } else if (anyRefunded) {
+            txn.setRefundStatus(
+                    RefundStatus.PARTIAL
+            );
+        }
+    }
+
+    private TransactionStatus computeStatus(BigDecimal totalAmount, BigDecimal amountPaid) {
+        if (amountPaid.compareTo(totalAmount) >= 0) {
+            return TransactionStatus.PAID;
+        }
+        return TransactionStatus.DEPOSIT;
+    }
+
+    private TransactionResponseDTO enrichWithPayments(TransactionResponseDTO dto) {
+        List<PaymentResponseDTO> paymentDTOs = paymentRepository
+                .findByTransactionTransactionIdOrderByCreatedAtDesc(dto.getTransactionId())
+                .stream().map(p -> {
+                    PaymentResponseDTO pd = new PaymentResponseDTO();
+                    pd.setId(p.getId());
+                    pd.setAmount(p.getAmount());
+                    pd.setPaymentMethod(p.getPaymentMethod().name());
+                    pd.setGcashNumber(p.getGcashNumber());
+                    pd.setReferenceNumber(p.getReferenceNumber());
+                    pd.setCreatedAt(p.getCreatedAt());
+                    return pd;
+                }).collect(Collectors.toList());
+        dto.setPayments(paymentDTOs);
+        return dto;
+    }
+}

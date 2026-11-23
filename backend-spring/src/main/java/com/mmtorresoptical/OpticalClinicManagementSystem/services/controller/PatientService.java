@@ -1,0 +1,398 @@
+package com.mmtorresoptical.OpticalClinicManagementSystem.services.controller;
+
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.DailyPatientPoint;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.DashboardPatientMetricsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.PatientMaintenanceMetricsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.PatientMetricsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.PatientProfileMetricsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.patient.PatientDetailsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.patient.PatientRequestDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.patient.PatientResponseDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.patient.PatientSearchResultDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.Sex;
+import com.mmtorresoptical.OpticalClinicManagementSystem.exception.custom.ConflictException;
+import com.mmtorresoptical.OpticalClinicManagementSystem.exception.custom.ResourceNotFoundException;
+import com.mmtorresoptical.OpticalClinicManagementSystem.mapper.PatientMapper;
+import com.mmtorresoptical.OpticalClinicManagementSystem.model.Patient;
+import com.mmtorresoptical.OpticalClinicManagementSystem.repository.PatientRepository;
+import com.mmtorresoptical.OpticalClinicManagementSystem.repository.PatientFollowUpRepository;
+import com.mmtorresoptical.OpticalClinicManagementSystem.repository.PrescriptionRepository;
+import com.mmtorresoptical.OpticalClinicManagementSystem.repository.TransactionRepository;
+import com.mmtorresoptical.OpticalClinicManagementSystem.repository.EyeExamRepository;
+import com.mmtorresoptical.OpticalClinicManagementSystem.security.HmacHashService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.auditlog.resources.PatientAuditHelper;
+import com.mmtorresoptical.OpticalClinicManagementSystem.specification.PatientSpecification;
+import com.mmtorresoptical.OpticalClinicManagementSystem.utils.NameUtils;
+import com.mmtorresoptical.OpticalClinicManagementSystem.utils.UUIDUtils;
+import lombok.RequiredArgsConstructor;
+import org.springframework.beans.BeanUtils;
+import org.springframework.data.domain.*;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.YearMonth;
+import java.util.*;
+import java.util.stream.Stream;
+
+@Service
+@RequiredArgsConstructor
+public class PatientService {
+    private final PatientRepository patientRepository;
+    private final PatientMapper patientMapper;
+    private final HmacHashService hmacHashService;
+    private final PatientAuditHelper patientAuditHelper;
+    private final TransactionRepository transactionRepository;
+    private final PrescriptionRepository prescriptionRepository;
+    private final PatientFollowUpRepository patientFollowUpRepository;
+    private final EyeExamRepository eyeExamRepository;
+
+    public PatientResponseDTO createPatient(PatientRequestDTO patientRequest) {
+        if(patientExistsByFirstMiddleLastName(patientRequest.getFirstName(), patientRequest.getMiddleName(), patientRequest.getLastName())) {
+            throw new ConflictException(
+                    "Patient's name is already existing in the records."
+            );
+        }
+
+        Patient patient = new Patient();
+
+        patient.setFirstName(patientRequest.getFirstName());
+        patient.setMiddleName(patientRequest.getMiddleName());
+        patient.setLastName(patientRequest.getLastName());
+
+        // Generate HMAC hashes for sensitive name fields
+        String firstNameHash = hmacHashService.hash(patientRequest.getFirstName());
+        String middleNameHash = Optional.ofNullable(patientRequest.getMiddleName())
+                .filter(name -> !name.isBlank())
+                .map(hmacHashService::hash)
+                .orElse(null);
+
+        String lastNameHash = hmacHashService.hash(patientRequest.getLastName());
+
+        patient.setFirstNameHash(firstNameHash);
+        patient.setMiddleNameHash(middleNameHash);
+        patient.setLastNameHash(lastNameHash);
+
+        patient.setSex(Sex.valueOf(patientRequest.getSex()));
+
+        patient.setContactNumber(patientRequest.getContactNumber());
+
+        // Set email and generate its hash
+        patient.setEmail(patientRequest.getEmail());
+        String emailHash = hmacHashService.hash(patientRequest.getEmail());
+        patient.setEmailHash(emailHash);
+
+        patient.setBirthDate(patientRequest.getBirthDate());
+
+        patient.setAddress(patientRequest.getAddress());
+
+        patient.setMedicalHistory(patientRequest.getMedicalHistory());
+
+        patient.setIsArchived(patientRequest.getIsArchived());
+
+        // Generate sortable full name for indexing/search
+        patient.setFullNameSortable(NameUtils.generateFullNameSortable(patient.getFirstName(),patient.getMiddleName(), patient.getLastName()));
+
+        Patient savedPatient = patientRepository.save(patient);
+
+        patientAuditHelper.logCreate(savedPatient);
+
+        return patientMapper.entityToResponse(savedPatient);
+    }
+
+    public Page<PatientDetailsDTO> getAllPatients(String keyword,
+                                                  int page,
+                                                  int size,
+                                                  String sortBy,
+                                                  String sortOrder,
+                                                  String archivedStatus,
+                                                  String sex) {
+
+        Specification<Patient> spec = Specification.allOf();
+
+        if (keyword != null && UUIDUtils.isUUID(keyword)) {
+
+            UUID id = UUID.fromString(keyword);
+
+            spec = spec.and(
+                    PatientSpecification.hasId(id)
+            );
+        } else if (keyword != null && !keyword.isEmpty()) {
+            spec = spec.and(PatientSpecification.nameContains(keyword));
+        }
+
+        spec = spec.and(
+                PatientSpecification.hasArchivedStatus(archivedStatus)
+        );
+
+        spec = spec.and(
+                PatientSpecification.hasSex(sex)
+        );
+
+        Sort.Direction direction;
+
+        try {
+            direction = Sort.Direction.fromString(sortOrder);
+        } catch (IllegalArgumentException ex) {
+            direction = Sort.Direction.DESC;
+        }
+
+        Pageable pageable = PageRequest.of(page, size, Sort.by(direction, sortBy));
+
+        Page<Patient> retrievedPatients = patientRepository.findAll(spec, pageable);
+
+        return retrievedPatients.map(patientMapper::entityToDetailedResponse);
+    }
+
+    public PatientDetailsDTO getPatientById(UUID id) {
+        Patient retrievedPatient = patientRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Patient not found with id: " + id));
+
+        return patientMapper.entityToDetailedResponse(retrievedPatient);
+    }
+
+    public PatientResponseDTO updatePatient(UUID id, PatientRequestDTO patientRequest) {
+        Patient retrievedPatient = patientRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Patient not found with id: " + id));
+
+
+        // Create a copy for logging (BEFORE snapshot)
+        Patient beforeUpdate = new Patient();
+        BeanUtils.copyProperties(retrievedPatient, beforeUpdate);
+
+        /* -----------------------------
+           Normalize input values
+        ----------------------------- */
+        String first = patientRequest.getFirstName();
+        String middle = Optional.ofNullable(patientRequest.getMiddleName()).orElse("");
+        String last = patientRequest.getLastName();
+
+        /* -----------------------------
+           Validate name uniqueness
+        ----------------------------- */
+        boolean nameChanged =
+                !retrievedPatient.getFirstName().equals(first) ||
+                        !Objects.equals(retrievedPatient.getMiddleName(), middle)
+                        ||
+                        !retrievedPatient.getLastName().equals(last);
+
+        if (nameChanged) {
+
+            boolean isNameExisting = patientExistsByFirstMiddleLastName(first, middle, last);
+
+            if(isNameExisting) {
+                throw new ConflictException("Name is already taken");
+            }
+
+            retrievedPatient.setFullNameSortable(NameUtils.generateFullNameSortable(first, middle, last));
+
+            retrievedPatient.setFirstNameHash(hmacHashService.hash(first));
+            String middleNameHash = Optional.ofNullable(patientRequest.getMiddleName())
+                    .filter(name -> !name.isBlank())
+                    .map(hmacHashService::hash)
+                    .orElse(null);
+            retrievedPatient.setMiddleNameHash(middleNameHash);
+            retrievedPatient.setLastNameHash(hmacHashService.hash(last));
+        }
+
+        /* -----------------------------
+           Apply updates to entity
+        ----------------------------- */
+        patientMapper.updatePatientFromDto(patientRequest, retrievedPatient);
+
+        Patient updatedPatient = patientRepository.save(retrievedPatient);
+
+        patientAuditHelper.logUpdate(beforeUpdate, updatedPatient);
+
+        return patientMapper.entityToResponse(updatedPatient);
+    }
+
+    public void archivePatient(UUID id) {
+        Patient retrievedPatient = patientRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Patient not found with id: " + id));
+
+        retrievedPatient.setIsArchived(true);
+
+        patientRepository.save(retrievedPatient);
+
+        patientAuditHelper.logArchive(retrievedPatient);
+    }
+
+    public void restorePatient(UUID id) {
+        Patient retrievedPatient = patientRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Patient not found with id: " + id));
+
+        retrievedPatient.setIsArchived(false);
+
+        patientRepository.save(retrievedPatient);
+
+        patientAuditHelper.logRestore(retrievedPatient);
+    }
+
+    /**
+     * Determines whether a patient record already exists
+     * based on first, middle, and last name.
+     *
+     * This method:
+     * - Hashes the provided name fields using HMAC
+     * - Handles nullable or blank middle names
+     * - Queries the database using hashed values
+     *
+     * @param firstName the patient's first name
+     * @param middleName the patient's middle name (nullable)
+     * @param lastName the patient's last name
+     * @return true if a matching patient exists; false otherwise
+     */
+    private boolean patientExistsByFirstMiddleLastName(
+            String firstName,
+            String middleName,
+            String lastName
+    ) {
+
+        String firstHash = hmacHashService.hash(firstName);
+        String middleHash = Optional.ofNullable(middleName)
+                .filter(name -> !middleName.isBlank())
+                .map(hmacHashService::hash)
+                .orElse(null);
+        String lastHash = hmacHashService.hash(lastName);
+
+        return patientRepository.existsByFirstNameHashAndMiddleNameHashAndLastNameHash(
+                firstHash,
+                middleHash,
+                lastHash
+        );
+    }
+
+    /**
+     * Determines whether a patient record already exists
+     * based on the provided email address.
+     *
+     * This method:
+     * - Hashes the email using HMAC
+     * - Queries the database using the hashed value
+     * - Prevents exposure of raw email data
+     *
+     * @param email the patient's email address
+     * @return true if a matching patient exists; false otherwise
+     */
+    private boolean patientExistsByEmail(
+            String email
+    ) {
+
+        String emailHash = hmacHashService.hash(email);
+
+        return patientRepository.existsByEmailHash(
+                emailHash
+        );
+    }
+
+    public Page<PatientSearchResultDTO> searchPatients(String keyword, int page, int size) {
+        Specification<Patient> spec = Specification.allOf();
+
+        if (keyword != null && !keyword.isBlank()) {
+            if (UUIDUtils.isUUID(keyword)) {
+                spec = spec.and(PatientSpecification.hasId(UUID.fromString(keyword)));
+            } else {
+                spec = spec.and(
+                        Specification.anyOf(
+                                PatientSpecification.nameContains(keyword),
+                                PatientSpecification.contactNumberContains(keyword)
+                        )
+                );
+            }
+        }
+
+        spec = spec.and(PatientSpecification.hasArchivedStatus("ACTIVE"));
+
+        Pageable pageable = PageRequest.of(page, size, Sort.by(Sort.Direction.ASC, "fullNameSortable"));
+        Page<Patient> patients = patientRepository.findAll(spec, pageable);
+        return patients.map(patientMapper::entityToSearchResultDTO);
+    }
+
+    public PatientMetricsDTO getPatientMetrics() {
+        LocalDateTime startOfMonth = YearMonth.now().atDay(1).atStartOfDay();
+        LocalDateTime startOfNextMonth = YearMonth.now().plusMonths(1).atDay(1).atStartOfDay();
+
+        long totalPatients = patientRepository.count();
+        long newThisMonth = patientRepository.countByCreatedAtBetween(startOfMonth, startOfNextMonth);
+        long pendingFollowUps = patientFollowUpRepository.countPendingFollowUps();
+        long archivedPatients = patientRepository.countByIsArchived(true);
+
+        return new PatientMetricsDTO(totalPatients, newThisMonth, pendingFollowUps, archivedPatients);
+    }
+
+    public DashboardPatientMetricsDTO getDashboardPatientMetrics() {
+        YearMonth thisMonth = YearMonth.now();
+        LocalDateTime startOfMonth = thisMonth.atDay(1).atStartOfDay();
+        LocalDateTime startOfNextMonth = thisMonth.plusMonths(1).atDay(1).atStartOfDay();
+
+        long totalActive = patientRepository.countByIsArchived(false);
+        long newThisMonth = patientRepository.countByCreatedAtBetween(startOfMonth, startOfNextMonth);
+        long pendingFollowUps = patientFollowUpRepository.countPendingFollowUps();
+        long patientsSeen = transactionRepository.countDistinctPatientsByTransactionDateBetween(startOfMonth, startOfNextMonth);
+
+        return new DashboardPatientMetricsDTO(totalActive, newThisMonth, pendingFollowUps, patientsSeen);
+    }
+
+    public List<DailyPatientPoint> getDailyPatientArrivals() {
+        YearMonth thisMonth = YearMonth.now();
+        LocalDateTime startOfMonth = thisMonth.atDay(1).atStartOfDay();
+        LocalDateTime startOfNextMonth = thisMonth.plusMonths(1).atDay(1).atStartOfDay();
+
+        List<Object[]> dayCounts = patientRepository.countPatientsGroupedByDay(startOfMonth, startOfNextMonth);
+
+        Map<Integer, Long> dayMap = new LinkedHashMap<>();
+        for (Object[] row : dayCounts) {
+            java.sql.Date sqlDate = (java.sql.Date) row[0];
+            int day = sqlDate.toLocalDate().getDayOfMonth();
+            long count = ((Number) row[1]).longValue();
+            dayMap.put(day, count);
+        }
+
+        int daysInMonth = thisMonth.lengthOfMonth();
+        List<DailyPatientPoint> result = new ArrayList<>();
+        for (int d = 1; d <= daysInMonth; d++) {
+            result.add(new DailyPatientPoint(d, dayMap.getOrDefault(d, 0L)));
+        }
+        return result;
+    }
+
+    public PatientMaintenanceMetricsDTO getMaintenanceMetrics() {
+        long archived = patientRepository.countByIsArchived(true);
+        long patientsWithoutPurchases = patientRepository.countActivePatientsWithNoTransactions();
+        long stalePendingFollowUps = patientFollowUpRepository.countStalePendingFollowUps(LocalDate.now().minusMonths(6));
+
+        return new PatientMaintenanceMetricsDTO(archived, patientsWithoutPurchases, stalePendingFollowUps);
+    }
+
+    public PatientProfileMetricsDTO getPatientProfileMetrics(UUID patientId) {
+        patientRepository.findById(patientId)
+                .orElseThrow(() -> new ResourceNotFoundException("Patient not found with id: " + patientId));
+
+        long totalVisits = transactionRepository.countByPatientId(patientId);
+
+        // Last visit = most recent from: transaction, prescription, eye exam, or completed follow-up
+        LocalDateTime lastVisitDate = Stream.of(
+                transactionRepository.findMaxTransactionDateByPatientId(patientId),
+                Optional.ofNullable(prescriptionRepository.findMaxIssueDateByPatientId(patientId))
+                        .map(java.time.LocalDate::atStartOfDay).orElse(null),
+                eyeExamRepository.findMaxCreatedAtByPatientId(patientId),
+                Optional.ofNullable(patientFollowUpRepository.findMaxActualVisitDateByPatientId(patientId))
+                        .map(java.time.LocalDate::atStartOfDay).orElse(null)
+        ).filter(Objects::nonNull).max(LocalDateTime::compareTo).orElse(null);
+
+        java.time.LocalDate lastRxDate = prescriptionRepository.findMaxIssueDateByPatientId(patientId);
+        LocalDateTime lastPrescriptionDate = lastRxDate != null ? lastRxDate.atStartOfDay() : null;
+        long purchasedProducts = transactionRepository.sumQuantityByPatientId(patientId);
+        java.math.BigDecimal totalAmount = transactionRepository.sumTotalAmountByPatientId(patientId);
+
+        return new PatientProfileMetricsDTO(
+                totalVisits,
+                lastVisitDate,
+                lastPrescriptionDate,
+                purchasedProducts,
+                totalAmount != null ? totalAmount : java.math.BigDecimal.ZERO
+        );
+    }
+}

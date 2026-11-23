@@ -1,0 +1,768 @@
+import { Printer } from "lucide-react";
+
+import { Dialog, DialogContent } from "@/shared/components/ui/dialog";
+import { Button } from "@/shared/components/ui/button";
+import type { TransactionResponse, TransactionItemResponse, RefundReceiptData } from "@/features/sales/types";
+
+const BUSINESS_NAME = "MM Torres Optical Clinic";
+const BUSINESS_ADDRESS = "259 Shoe Avenue, Sto. Nino, Marikina City, 1806";
+const BUSINESS_ADDRESS_LINE2 = "Metro Manila, Philippines";
+const BUSINESS_PHONE = "(02) 933 7725";
+
+export type PrintMode = "ORIGINAL" | "UPDATED" | "DUAL_SLIP" | "PICK_SLIP";
+
+interface PrintableReceiptProps {
+  open: boolean;
+  onClose: () => void;
+  transaction: TransactionResponse;
+  printMode: PrintMode;
+  isReprint?: boolean;
+  extraButton?: React.ReactNode;
+}
+
+const formatDateTime = (dateStr: string) =>
+  new Date(dateStr).toLocaleString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
+const format2 = (n: number) => n.toFixed(2);
+
+// ────────────────────────────────────────────────────────────
+// ORIGINAL Sales Receipt
+// ────────────────────────────────────────────────────────────
+const OriginalReceipt: React.FC<{
+  transaction: TransactionResponse;
+  isReprint?: boolean;
+}> = ({ transaction: tx, isReprint }) => {
+  const date = new Date(tx.transactionDate);
+  const dateStr = date.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+  const timeStr = date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+  const subtotal = tx.transactionItems.reduce((sum, i) => sum + i.unitPrice * i.quantity, 0);
+
+  const totalDiscount = tx.transactionItems.reduce((sum, i) => {
+    if (i.isDiscounted) return sum + (i.unitPrice * i.quantity - i.subtotal);
+    return sum;
+  }, 0);
+
+  return (
+    <div className="receipt-canvas font-mono text-xs leading-relaxed text-foreground max-h-[65vh] overflow-y-auto print:max-h-none print:overflow-visible">
+      {/* Watermark for reprints */}
+      {isReprint && (
+        <div className="text-center mb-4 border border-dashed border-border py-2 px-4 rounded">
+          <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">
+            DUPLICATE COPY / REPRINT
+          </p>
+          <p className="text-[10px] text-muted-foreground mt-0.5">
+            Original: {dateStr} {timeStr}
+          </p>
+        </div>
+      )}
+
+      <div className="text-center mb-4">
+        <h2 className="text-xs font-bold tracking-wide uppercase text-muted-foreground mb-1">
+          SALES RECEIPT
+        </h2>
+        <h2 className="receipt-title text-sm font-bold tracking-wide uppercase">
+          {BUSINESS_NAME}
+        </h2>
+        <p className="text-[10px] text-muted-foreground mt-0.5">{BUSINESS_ADDRESS}</p>
+        <p className="text-[10px] text-muted-foreground">{BUSINESS_ADDRESS_LINE2}</p>
+        <p className="text-[10px] text-muted-foreground">{BUSINESS_PHONE}</p>
+      </div>
+
+      <hr className="border-dashed border-border mb-3" />
+
+      <div className="space-y-0.5 mb-3">
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Receipt #</span>
+          <span className="font-semibold">{tx.transactionNumber}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Date</span>
+          <span>{dateStr}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Time</span>
+          <span>{timeStr}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Cashier</span>
+          <span>{tx.createdBy.fullName}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Payment Status</span>
+          <span className={`font-semibold rounded-sm px-1.5 py-0.5 text-xs text-white leading-none inline-flex items-center ${(tx.amountPaid ?? 0) >= tx.totalAmount ? "bg-green-600" : "bg-orange-600"}`}>
+            {(tx.amountPaid ?? 0) >= tx.totalAmount ? "PAID" : "DEPOSIT"}
+          </span>
+        </div>
+        {tx.patient && (
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Patient</span>
+            <span>{tx.patient.fullName}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Senior/PWD Discount Info */}
+      {tx.isSeniorPwdApplied && (
+        <div className="mb-3 border border-dashed border-border rounded-sm px-2 py-1.5">
+          <p className="font-semibold mb-0.5">
+            {tx.seniorPwdType === "SENIOR_CITIZEN" ? "Senior Citizen" : tx.seniorPwdType === "PWD" ? "PWD" : "Senior / PWD"} Discount Applied
+          </p>
+          <div className="text-[10px] text-muted-foreground">
+            <div className="flex justify-between">
+              <span>Name</span>
+              <span>{tx.seniorPwdName}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Address</span>
+              <span>{tx.seniorPwdAddress}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>ID Number</span>
+              <span>{tx.seniorPwdIdNumber}</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <hr className="border-dashed border-border mb-3" />
+
+      <table className="w-full mb-3">
+        <thead>
+          <tr className="border-b border-border">
+            <th className="text-left font-semibold pb-1">Item</th>
+            <th className="text-center font-semibold pb-1 w-10">Qty</th>
+            <th className="receipt-num text-right font-semibold pb-1 w-20">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          {tx.transactionItems.map((item) => {
+            const originalTotal = item.unitPrice * item.quantity;
+            return (
+              <tr key={item.transactionItemId}>
+                <td className="py-1 align-top break-words w-[55%]">
+                  <span className="font-medium">{item.product.productName}</span>
+                  {item.isDiscounted && (
+                    <div className="text-[10px] text-muted-foreground">
+                      <span>{format2(item.unitPrice)} × {item.quantity}</span>
+                      <span className="text-green-600 ml-1">
+                        ({item.discountType === "PERCENT"
+                          ? `${item.discountValue}%`
+                          : `₱${format2(item.discountValue)}`}{" "}
+                        off)
+                      </span>
+                    </div>
+                  )}
+                  {item.quantity > 1 && (
+                    <div className="text-[11px] text-muted-foreground">
+                      └─ ₱{format2(item.unitPrice)} each
+                    </div>
+                  )}
+                </td>
+                <td className="py-1 text-center align-top text-muted-foreground">{item.quantity}</td>
+                <td className="receipt-num py-1 text-right align-top tabular-nums">
+                  {item.isDiscounted ? (
+                    <>
+                      <span className="text-muted-foreground line-through text-[10px] block">
+                        {format2(originalTotal)}
+                      </span>
+                      <span className="font-medium text-green-600">
+                        {format2(item.subtotal)}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="font-medium">{format2(originalTotal)}</span>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+
+      <hr className="border-dashed border-border mb-3" />
+
+      {/* Summary */}
+      <div className="space-y-0.5 mb-3">
+        <div className="flex justify-between text-muted-foreground">
+          <span>Subtotal</span>
+          <span className="receipt-num tabular-nums">{format2(subtotal)}</span>
+        </div>
+        {totalDiscount > 0 && (
+          <div className="flex justify-between text-green-600">
+            <span>Discount</span>
+            <span className="receipt-num tabular-nums">-{format2(totalDiscount)}</span>
+          </div>
+        )}
+        <div className="receipt-total flex justify-between font-bold text-sm border-t border-border pt-1 mt-1">
+          <span>TOTAL</span>
+          <span className="receipt-num tabular-nums">{format2(tx.totalAmount)}</span>
+        </div>
+      </div>
+
+      <div className="mb-3">
+        {(tx.payments ?? []).map((p) => (
+          <div key={p.id}>
+            <div className="flex justify-between font-semibold">
+              <span>{p.paymentMethod}</span>
+              <span className="receipt-num tabular-nums">{format2(p.amount)}</span>
+            </div>
+            {p.referenceNumber && (
+              <div className="text-[10px] text-muted-foreground mt-0.5">
+                Ref# {p.referenceNumber}
+              </div>
+            )}
+            {p.gcashNumber && (
+              <div className="text-[10px] text-muted-foreground mt-0.5">
+                GCash No# {p.gcashNumber}
+              </div>
+            )}
+          </div>
+        ))}
+        {(() => {
+          const totalTendered = (tx.payments ?? []).reduce((sum, p) => sum + p.amount, 0);
+          const changeAmount = Math.max(0, totalTendered - tx.totalAmount);
+          if (changeAmount > 0) {
+            return (
+              <div className="flex justify-between text-green-600 font-semibold mt-0.5">
+                <span>Change</span>
+                <span className="receipt-num tabular-nums">{format2(changeAmount)}</span>
+              </div>
+            );
+          }
+          return null;
+        })()}
+        {(tx.balanceDue ?? 0) > 0 && (
+          <div className="flex justify-between text-amber-600 font-semibold mt-0.5">
+            <span>Remaining Balance</span>
+            <span className="receipt-num tabular-nums">{format2(tx.balanceDue ?? 0)}</span>
+          </div>
+        )}
+      </div>
+
+      <hr className="border-dashed border-border mb-3" />
+
+      <div className="text-center text-[10px] text-muted-foreground space-y-1">
+        <p>Refunds accepted. Receipt and original packaging required.</p>
+        <p className="font-medium text-foreground text-xs mt-2">
+          Thank you for choosing MM Torres Optical!
+        </p>
+      </div>
+    </div>
+  );
+};
+
+const paymentStatusColor = (status: string) => {
+  switch (status) {
+    case "DEPOSIT": return "bg-orange-600";
+    case "PAID": return "bg-green-600";
+    case "VOIDED": return "bg-red-700";
+    default: return "bg-gray-500";
+  }
+};
+
+const refundStatusColor = (status: string) => {
+  switch (status) {
+    case "PARTIAL": return "bg-purple-600";
+    case "FULL": return "bg-gray-600";
+    default: return "bg-gray-500";
+  }
+};
+
+// ────────────────────────────────────────────────────────────
+// UPDATED Statement of Account
+// ────────────────────────────────────────────────────────────
+const UpdatedStatement: React.FC<{ transaction: TransactionResponse }> = ({ transaction: tx }) => {
+  const date = new Date(tx.transactionDate);
+  const dateStr = date.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+  const now = new Date();
+  const printedStr = now.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+  const printedTime = now.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
+  // Active items: quantity - refundedQuantity > 0
+  const activeItems = tx.transactionItems
+    .map((item) => {
+      const activeQty = item.quantity - (item.refundedQuantity ?? 0);
+      if (activeQty <= 0) return null;
+      const activeSubtotal = activeQty * item.unitPrice;
+      let discountAmount = 0;
+      if (item.isDiscounted) {
+        if (item.discountType === "PERCENT") {
+          discountAmount = activeSubtotal * (item.discountValue / 100);
+        } else {
+          const discountPerUnit = item.discountValue / item.quantity;
+          discountAmount = discountPerUnit * activeQty;
+        }
+      }
+      return {
+        ...item,
+        activeQty,
+        activeSubtotal: activeSubtotal - discountAmount,
+        discountAmount,
+        activeUnitPrice: item.unitPrice,
+      };
+    })
+    .filter(Boolean) as (TransactionItemResponse & {
+    activeQty: number;
+    activeSubtotal: number;
+    discountAmount: number;
+    activeUnitPrice: number;
+  })[];
+
+  // Flatten all refund records from refundReceipts
+  const allRefunds = (tx.refundReceipts ?? []).flatMap((receipt) =>
+    (receipt.refundItems ?? []).map((item) => ({
+      ...item,
+      receiptNumber: receipt.receiptNumber,
+      refundMethod: receipt.refundMethod,
+      actualCashback: receipt.actualCashback,
+      createdAt: receipt.createdAt,
+    }))
+  );
+
+  const totalDeductions = allRefunds.reduce((sum, r) => sum + (r.itemCreditAmount ?? 0), 0);
+  const revisedTotal = tx.totalAmount - totalDeductions;
+
+  // Cash actually refunded (not balance adjustments)
+  const totalCashRefunded = (tx.refundReceipts ?? []).reduce((sum, receipt) => {
+    if (receipt.refundMethod === "CASH" || receipt.refundMethod === "GCASH") {
+      return sum + (receipt.actualCashback ?? 0);
+    }
+    return sum;
+  }, 0);
+
+  // Effective balance due = revised total minus net cash position
+  const effectiveBalanceDue = Math.max(0, revisedTotal - ((tx.amountPaid ?? 0) - totalCashRefunded));
+
+  return (
+    <div className="receipt-canvas font-mono text-xs leading-relaxed text-foreground max-h-[65vh] overflow-y-auto print:max-h-none print:overflow-visible">
+      <div className="text-center mb-4">
+        <h2 className="text-xs font-bold tracking-wide uppercase text-muted-foreground mb-1">
+          AMENDED STATEMENT OF ACCOUNT
+        </h2>
+        <h2 className="receipt-title text-sm font-bold tracking-wide uppercase">
+          {BUSINESS_NAME}
+        </h2>
+        <p className="text-[10px] text-muted-foreground mt-0.5">{BUSINESS_ADDRESS}</p>
+        <p className="text-[10px] text-muted-foreground">{BUSINESS_ADDRESS_LINE2}</p>
+        <p className="text-[10px] text-muted-foreground">{BUSINESS_PHONE}</p>
+      </div>
+
+      <hr className="border-dashed border-border mb-3" />
+
+      {/* Metadata */}
+      <div className="space-y-0.5 mb-3">
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Original Txn #</span>
+          <span className="font-semibold">{tx.transactionNumber}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Transaction Date</span>
+          <span>{dateStr}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Statement Printed</span>
+          <span>{printedStr} {printedTime}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Cashier</span>
+          <span>{tx.createdBy.fullName}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Payment Status</span>
+          <span className={`font-semibold rounded-sm px-1.5 py-0.5 text-xs text-white leading-none inline-flex items-center ${paymentStatusColor(tx.transactionStatus)}`}>
+            {tx.transactionStatus}
+          </span>
+        </div>
+        {tx.refundStatus && tx.refundStatus !== "NONE" && (
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Refund Status</span>
+            <span className={`font-semibold rounded-sm px-1.5 py-0.5 text-xs text-white leading-none inline-flex items-center ${refundStatusColor(tx.refundStatus)}`}>
+              {tx.refundStatus}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {tx.patient && (
+        <div className="mb-3">
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Patient</span>
+            <span>{tx.patient.fullName}</span>
+          </div>
+        </div>
+      )}
+
+      {/* Senior/PWD Discount Info */}
+      {tx.isSeniorPwdApplied && (
+        <div className="mb-3 border border-dashed border-border rounded-sm px-2 py-1.5">
+          <p className="font-semibold mb-0.5">
+            {tx.seniorPwdType === "SENIOR_CITIZEN" ? "Senior Citizen" : tx.seniorPwdType === "PWD" ? "PWD" : "Senior / PWD"} Discount Applied
+          </p>
+          <div className="text-[10px] text-muted-foreground">
+            <div className="flex justify-between">
+              <span>Name</span>
+              <span>{tx.seniorPwdName}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Address</span>
+              <span>{tx.seniorPwdAddress}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>ID Number</span>
+              <span>{tx.seniorPwdIdNumber}</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <hr className="border-dashed border-border mb-3" />
+
+      {/* Active Items */}
+      {activeItems.length > 0 && (
+        <>
+          <h3 className="text-xs font-semibold mb-2 uppercase">Active Items</h3>
+          <table className="w-full mb-3">
+            <thead>
+              <tr className="border-b border-border">
+                <th className="text-left font-semibold pb-1">Item</th>
+                <th className="text-center font-semibold pb-1 w-10">Qty</th>
+                <th className="receipt-num text-right font-semibold pb-1 w-20">Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {activeItems.map((item) => (
+                <tr key={item.transactionItemId} className="border-b border-border/30">
+                  <td className="py-1 align-top">
+                    <span className="font-medium">{item.product.productName}</span>
+                    {item.isDiscounted && (
+                      <span className="text-green-600">
+                        {" "}
+                        ({item.discountType === "PERCENT"
+                          ? `${item.discountValue}%`
+                          : `₱${format2(item.discountValue)}`}{" "}
+                        off)
+                      </span>
+                    )}
+                    {item.activeQty > 1 && (
+                      <div className="text-[11px] text-muted-foreground">
+                        └─ ₱{format2(item.unitPrice)} each
+                      </div>
+                    )}
+                  </td>
+                  <td className="receipt-num py-1 text-center align-top text-muted-foreground">{item.activeQty}</td>
+                  <td className="receipt-num py-1 text-right align-top tabular-nums font-medium">
+                    {format2(item.activeSubtotal)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {/* Returns & Adjustments — grouped by refund receipt */}
+      {allRefunds.length > 0 && (
+        <>
+          <hr className="border-dashed border-border mb-3" />
+          <h3 className="text-xs font-semibold mb-2 uppercase">Returns &amp; Adjustments</h3>
+          {(tx.refundReceipts ?? []).map((receipt: RefundReceiptData) => (
+            <div key={receipt.refundReceiptId} className="mb-3">
+              <div className="flex justify-between text-[10px] text-muted-foreground mb-1 px-0.5">
+                <span className="font-semibold text-foreground">{receipt.receiptNumber}</span>
+                <span>{formatDateTime(receipt.createdAt)}</span>
+              </div>
+              <table className="w-full mb-1">
+                <thead>
+                  <tr className="border-b border-border/30">
+                    <th className="text-left font-medium pb-0.5 text-[10px]">Item</th>
+                    <th className="text-center font-medium pb-0.5 w-8 text-[10px]">Qty</th>
+                    <th className="receipt-num text-right font-medium pb-0.5 w-16 text-[10px]">Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(receipt.refundItems ?? []).map((item, idx) => (
+                    <tr key={idx} className="border-b border-border/30">
+                      <td className="py-0.5 text-[10px]">{item.productName}</td>
+                      <td className="py-0.5 text-center text-red-600 text-[10px]">-{item.quantityRefunded}</td>
+                      <td className="receipt-num py-0.5 text-right tabular-nums text-red-600 text-[10px]">
+                        -₱{format2(item.itemCreditAmount ?? 0)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="flex justify-between text-[10px] text-muted-foreground px-0.5">
+                <span>
+                  {receipt.refundMethod === "BALANCE_ADJUSTMENT"
+                    ? "Balance Adjustment"
+                    : receipt.refundMethod}
+                </span>
+                {receipt.actualCashback > 0 ? (
+                  <span className="text-red-600">Cash back: ₱{format2(receipt.actualCashback)}</span>
+                ) : (
+                  <span>Balance adjustment</span>
+                )}
+              </div>
+            </div>
+          ))}
+        </>
+      )}
+
+      <hr className="border-dashed border-border mb-3" />
+
+      {/* Waterfall Ledger Summary */}
+      <div className="space-y-1 mb-3">
+        <div className="flex justify-between">
+          <span>Original Order Total:</span>
+          <span className="receipt-num tabular-nums">₱{format2(tx.totalAmount)}</span>
+        </div>
+        <div className="flex justify-between text-red-600">
+          <span>Total Deductions:</span>
+          <span className="receipt-num tabular-nums">-₱{format2(totalDeductions)}</span>
+        </div>
+        <hr className="border-dashed border-border my-0.5" />
+        <div className="flex justify-between font-bold">
+          <span>REVISED TOTAL VALUE:</span>
+          <span className="receipt-num tabular-nums">₱{format2(revisedTotal)}</span>
+        </div>
+        <hr className="border-double border-border my-0.5" />
+        <div className="flex justify-between">
+          <span>Total Cash Collected:</span>
+          <span className="receipt-num tabular-nums">₱{format2(tx.amountPaid ?? 0)}</span>
+        </div>
+        <div className="flex justify-between font-bold">
+          <span>CURRENT BALANCE DUE:</span>
+          <span className="receipt-num tabular-nums">₱{format2(effectiveBalanceDue)}</span>
+        </div>
+      </div>
+
+      {/* Empty state — no refunds, all items active */}
+      {allRefunds.length === 0 && (
+        <div className="text-center text-muted-foreground text-[10px] mb-3">
+          <p>No returns or adjustments recorded.</p>
+          <p>This account is current as of {printedStr}.</p>
+        </div>
+      )}
+
+      <hr className="border-dashed border-border mb-4" />
+
+      {/* Signature */}
+      <div className="mb-4">
+        <p className="text-xs text-muted-foreground mb-8">
+          Customer Acknowledgment Signature: _________________________
+        </p>
+      </div>
+
+      <div className="text-center text-[10px] text-muted-foreground">
+        <p className="font-medium text-foreground text-xs">
+          Thank you for choosing MM Torres Optical!
+        </p>
+      </div>
+    </div>
+  );
+};
+
+// ────────────────────────────────────────────────────────────
+// STAFF PICK LIST — Internal batch-level retrieval directive
+// ────────────────────────────────────────────────────────────
+const StaffPickSlip: React.FC<{
+  transaction: TransactionResponse;
+}> = ({ transaction: tx }) => {
+  const date = new Date(tx.transactionDate);
+  const dateStr = date.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+  const timeStr = date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
+  // Consolidate items by product name and batch number
+  const consolidatedItems = new Map<string, {
+    productName: string;
+    batches: Map<string, { productBatchId: number; batchNumber: string; quantity: number }>;
+    isService: boolean;
+  }>();
+
+  tx.transactionItems.forEach((item) => {
+    const productName = item.product.productName;
+    const hasBatches = item.batchAllocations && item.batchAllocations.length > 0;
+
+    if (!consolidatedItems.has(productName)) {
+      consolidatedItems.set(productName, {
+        productName,
+        batches: new Map(),
+        isService: !hasBatches,
+      });
+    }
+
+    const entry = consolidatedItems.get(productName)!;
+
+    if (hasBatches) {
+      item.batchAllocations!.forEach((alloc) => {
+        const batchKey = alloc.batchNumber;
+        const existing = entry.batches.get(batchKey);
+        if (existing) {
+          existing.quantity += alloc.quantityDeducted;
+        } else {
+          entry.batches.set(batchKey, {
+            productBatchId: alloc.productBatchId,
+            batchNumber: alloc.batchNumber,
+            quantity: alloc.quantityDeducted,
+          });
+        }
+      });
+    }
+  });
+
+  const itemsWithBatches = Array.from(consolidatedItems.values()).filter(
+    (item) => item.batches.size > 0
+  );
+
+  const serviceItems = Array.from(consolidatedItems.values()).filter(
+    (item) => item.isService
+  );
+
+  const totalUnits = itemsWithBatches.reduce(
+    (sum, item) =>
+      sum + Array.from(item.batches.values()).reduce((s, b) => s + b.quantity, 0),
+    0
+  );
+
+  return (
+    <div className="max-h-[65vh] overflow-y-auto print:max-h-none print:overflow-visible">
+      <div className="bg-primary text-primary-foreground pl-3 pr-10 py-2 print:bg-transparent print:text-black print:border-b-2 print:border-black">
+        <h2 className="text-base font-bold">STAFF PICK LIST</h2>
+      </div>
+
+      <div className="px-3 py-2 border-b print:border-black">
+        <div className="grid grid-cols-2 gap-2 text-xs">
+          <div>
+            <p className="text-[10px] text-muted-foreground">Transaction #</p>
+            <p className="font-semibold">{tx.transactionNumber}</p>
+          </div>
+          <div>
+            <p className="text-[10px] text-muted-foreground">Date & Time</p>
+            <p>{dateStr} at {timeStr}</p>
+          </div>
+          {tx.patient && (
+            <div className="col-span-2">
+              <p className="text-[10px] text-muted-foreground">Patient</p>
+              <p className="font-semibold">{tx.patient.fullName}</p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Pick List Items */}
+      <div className="px-3 py-2 space-y-1.5">
+        {itemsWithBatches.map((item) => (
+          <div key={item.productName} className="border rounded px-2 py-1.5 print:border-black">
+            <h3 className="font-semibold text-xs mb-1">{item.productName}</h3>
+            <div className="space-y-0.5">
+              {Array.from(item.batches.values()).map((batch) => (
+                <div key={batch.productBatchId} className="flex items-center gap-2 bg-muted/50 px-2 py-1 rounded print:bg-transparent print:border print:border-black">
+                  <div className="flex-1">
+                    <p className="text-[11px]">
+                      Pull <span className="font-bold text-sm">{batch.quantity}</span>{" "}
+                      {batch.quantity === 1 ? "unit" : "units"}
+                    </p>
+                    <p className="text-[10px] text-muted-foreground print:text-black">
+                      Batch: <span className="font-mono font-semibold">{batch.batchNumber}</span>
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+
+        {/* Service items */}
+        {serviceItems.map((item) => (
+          <div key={item.productName} className="border rounded px-2 py-1.5 print:border-black">
+            <h3 className="font-semibold text-xs mb-1">{item.productName}</h3>
+            <div className="flex items-center gap-2 bg-muted/30 px-2 py-1 rounded print:bg-transparent print:border print:border-black">
+              <p className="text-[11px] text-muted-foreground print:text-black">
+                Service — no physical pull needed
+              </p>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="px-3 py-2 border-t print:border-black">
+        <div className="flex justify-between items-center">
+          <span className="font-semibold text-xs">Total units to pull:</span>
+          <span className="text-lg font-bold">{totalUnits}</span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ────────────────────────────────────────────────────────────
+// PrintableReceipt — dual-mode wrapper
+// ────────────────────────────────────────────────────────────
+const PrintableReceipt: React.FC<PrintableReceiptProps> = ({
+  open,
+  onClose,
+  transaction,
+  printMode,
+  isReprint = false,
+  extraButton,
+}) => {
+  const handlePrint = () => {
+    window.print();
+  };
+
+  if (!open) return null;
+
+  const isDualSlip = printMode === "DUAL_SLIP";
+  const isPickSlip = printMode === "PICK_SLIP";
+  const isUpdated = printMode === "UPDATED";
+
+  return (
+    <Dialog open={open} onOpenChange={onClose}>
+      <DialogContent className={isDualSlip ? "max-w-2xl" : ""}>
+        {isUpdated ? (
+          <UpdatedStatement transaction={transaction} />
+        ) : isDualSlip ? (
+          <>
+            <OriginalReceipt transaction={transaction} isReprint={isReprint} />
+            <div className="receipt-separator border-t border-dashed border-border mt-4 pt-4 print:break-before-page print:border-0 print:mt-0 print:pt-0">
+              <div className="text-center text-muted-foreground text-[10px] mb-2 print:hidden">
+                ✂ - - - - - - - - - - - - - - - - - - - - - - - - - -
+              </div>
+              <StaffPickSlip transaction={transaction} />
+            </div>
+          </>
+        ) : isPickSlip ? (
+          <StaffPickSlip transaction={transaction} />
+        ) : (
+          <OriginalReceipt transaction={transaction} isReprint={isReprint} />
+        )}
+
+        <div className="receipt-actions flex gap-2 mt-4 print:hidden">
+          {!isPickSlip && (
+          <Button className="flex-1" onClick={handlePrint}>
+            <Printer className="mr-2 h-4 w-4" />
+            {isUpdated ? "Print Statement" : isDualSlip ? "Print Receipts" : "Print Receipt"}
+          </Button>
+          )}
+          {extraButton}
+          <Button
+            variant="outline"
+            className="flex-1 border-2 border-gray-400 dark:border-gray-500"
+            onClick={onClose}
+          >
+            Close
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+};
+
+export default PrintableReceipt;

@@ -1,0 +1,107 @@
+import api from "@/shared/lib/axiosInstance";
+import axios from "axios";
+
+export interface LastBackupInfo {
+  timestamp: string;
+  details: string;
+  performedBy: string;
+  backupTimestamp: string;
+  backupPerformedBy: string;
+}
+
+export interface BackupFileMetadata {
+  backupTimestamp: string;
+  performedBy: string;
+  databaseName: string;
+}
+
+export const readMetadataFromFile = async (file: File): Promise<BackupFileMetadata | null> => {
+  try {
+    const slice = file.slice(0, 2048);
+    const text = await slice.text();
+    const newlineIdx = text.indexOf("\n");
+    if (newlineIdx <= 0) return null;
+    const firstLine = text.substring(0, newlineIdx);
+    if (!firstLine.startsWith("{")) return null;
+    const parsed = JSON.parse(firstLine);
+    if (parsed.backupTimestamp && parsed.performedBy) {
+      return parsed as BackupFileMetadata;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+export const fetchLastBackup = async (): Promise<LastBackupInfo> => {
+  const { data } = await api.get("/admin/database/last-backup");
+  return data;
+};
+
+export const fetchLastRestore = async (): Promise<LastBackupInfo> => {
+  const { data } = await api.get("/admin/database/last-restore");
+  return data;
+};
+
+export const downloadBackup = async (password: string): Promise<void> => {
+  let response;
+  try {
+    response = await api.post("/admin/database/backup", { currentPassword: password }, {
+      responseType: "blob",
+      timeout: 1800000, // 30 minutes
+    });
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.data instanceof Blob) {
+      const text = await error.response.data.text();
+      try {
+        const json = JSON.parse(text);
+        throw new Error(json.message || json.error || text);
+      } catch {
+        if (text) throw new Error(text);
+      }
+    }
+    throw error;
+  }
+
+  const blob = response.data as Blob;
+  const contentDisposition = response.headers["content-disposition"] as string | undefined;
+  let filename = "backup.dump";
+  if (contentDisposition) {
+    const match = contentDisposition.match(/filename="(.+)"/);
+    if (match) filename = match[1];
+  }
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+};
+
+export const restoreBackup = async (file: File, password: string): Promise<string> => {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("currentPassword", password);
+
+  try {
+    const response = await api.post("/admin/database/restore", formData, {
+      timeout: 1800000, // 30 minutes
+    });
+    return (response.data as { message: string }).message;
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.data) {
+      const serverMessage = error.response.data;
+      if (typeof serverMessage === "string") {
+        throw new Error(serverMessage);
+      }
+      if (typeof serverMessage === "object") {
+        const messages = Object.values(serverMessage).flat().join(", ");
+        if (messages) throw new Error(messages);
+      }
+    }
+    throw error;
+  }
+};

@@ -1,0 +1,180 @@
+package com.mmtorresoptical.OpticalClinicManagementSystem.services.auditlog;
+
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.audit.AuditDetailsDTO;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.ActionType;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.ResourceType;
+import com.mmtorresoptical.OpticalClinicManagementSystem.mapper.AuditMapper;
+import com.mmtorresoptical.OpticalClinicManagementSystem.model.AuditLog;
+import com.mmtorresoptical.OpticalClinicManagementSystem.model.User;
+import com.mmtorresoptical.OpticalClinicManagementSystem.repository.AuditLogRepository;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.AuthenticatedUserService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.specification.AuditLogSpecification;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.helper.JSONService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.security.AesEncryptionService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.utils.UUIDUtils;
+import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.data.domain.*;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+public class AuditLogService {
+
+    private static final Logger log = LoggerFactory.getLogger(AuditLogService.class);
+    private static final String ENC_PREFIX = "ENC:";
+
+    private final AuditLogRepository auditLogRepository;
+    private final AuthenticatedUserService authenticatedUserService;
+    private final AuditMapper auditMapper;
+    private final JSONService jsonService;
+    private final AesEncryptionService aesEncryptionService;
+
+    public void log(ActionType actionType,
+                    ResourceType resourceType,
+                    UUID resourceId,
+                    String details,
+                    String detailsJSON) {
+
+        User authenticatedUser = authenticatedUserService.getCurrentUser();
+
+        AuditLog log = new AuditLog();
+        log.setUser(authenticatedUser);
+        log.setActionType(actionType);
+        log.setResourceType(resourceType);
+        log.setResourceId(resourceId);
+        log.setDetails(details);
+        log.setDetailsJson(ENC_PREFIX + aesEncryptionService.encrypt(detailsJSON));
+
+        auditLogRepository.save(log);
+    }
+
+    public void logForUser(ActionType actionType,
+                           ResourceType resourceType,
+                           UUID resourceId,
+                           String details,
+                           String detailsJSON,
+                           User user) {
+
+        AuditLog log = new AuditLog();
+        log.setUser(user);
+        log.setActionType(actionType);
+        log.setResourceType(resourceType);
+        log.setResourceId(resourceId);
+        log.setDetails(details);
+        log.setDetailsJson(ENC_PREFIX + aesEncryptionService.encrypt(detailsJSON));
+
+        auditLogRepository.save(log);
+    }
+
+    private String decryptIfNeeded(String detailsJson, String userName) {
+        if (detailsJson != null && detailsJson.startsWith(ENC_PREFIX)) {
+            log.info("Admin user '{}' viewed encrypted audit data", userName);
+            return aesEncryptionService.decrypt(detailsJson.substring(ENC_PREFIX.length()));
+        }
+        return detailsJson;
+    }
+
+    private boolean isSystemGeneratedBackup(AuditDetailsDTO dto) {
+        if (!"BACKUP".equals(dto.getActionType()) || !"DATABASE".equals(dto.getResourceType())) {
+            return false;
+        }
+        String details = dto.getDetails();
+        return details != null && (details.equals("Daily backup at 5:00 PM") || details.startsWith("Backup at "));
+    }
+
+    public Page<AuditDetailsDTO> getAllAuditLogs(String keyword,
+                                                 ActionType actionType,
+                                                 ResourceType resourceType,
+                                                 UUID resourceId,
+                                                 UUID userId,
+                                                 LocalDate minDate,
+                                                 LocalDate maxDate,
+                                                 int page,
+                                                 int size,
+                                                 String sortBy,
+                                                 String sortOrder) {
+
+
+        if (keyword != null && UUIDUtils.isUUID(keyword)) {
+
+            Optional<AuditLog> log =
+                    auditLogRepository.findById(UUID.fromString(keyword));
+
+            if (log.isEmpty()) {
+                return Page.empty();
+            }
+
+            AuditDetailsDTO dto = auditMapper.entityToDetailsDTO(log.get());
+            String raw = decryptIfNeeded(dto.getDetailsJson(), dto.getUserName());
+            dto.setDetailsJson(jsonService.sanitizeAuditDetailsJson(
+                    raw, dto.getActionType(), dto.getUserName()));
+
+            return new PageImpl<>(
+                    List.of(dto),
+                    PageRequest.of(page, size),
+                    1
+            );
+        }
+
+        Sort.Direction direction;
+
+        try {
+            direction = Sort.Direction.fromString(sortOrder);
+        } catch (IllegalArgumentException ex) {
+            direction = Sort.Direction.DESC;
+        }
+
+        Specification<AuditLog> spec = Specification.allOf();
+
+        if (keyword != null && !keyword.isBlank()) {
+            spec = spec.and(AuditLogSpecification.userNameOrUsernameContains(keyword));
+        }
+
+        if (actionType != null) {
+            spec = spec.and(AuditLogSpecification.hasActionType(actionType));
+        }
+
+        if (resourceType != null) {
+            spec = spec.and(AuditLogSpecification.hasResourceType(resourceType));
+        }
+
+        if (resourceId != null) {
+            spec = spec.and(AuditLogSpecification.hasResourceId(resourceId));
+        }
+
+        if (userId != null) {
+            spec = spec.and(AuditLogSpecification.hasUserId(userId));
+        }
+
+        if (minDate != null || maxDate != null) {
+            spec = spec.and(
+                    AuditLogSpecification.dateBetween(minDate, maxDate)
+            );
+        }
+
+        Pageable pageable = PageRequest.of(page, size, Sort.by(direction, sortBy));
+
+        Page<AuditLog> auditLogs = auditLogRepository.findAll(spec, pageable);
+
+        return auditLogs.map(auditLog -> {
+            AuditDetailsDTO dto = auditMapper.entityToDetailsDTO(auditLog);
+            String raw = decryptIfNeeded(dto.getDetailsJson(), dto.getUserName());
+            dto.setDetailsJson(jsonService.sanitizeAuditDetailsJson(
+                    raw, dto.getActionType(), dto.getUserName()));
+            
+            if (isSystemGeneratedBackup(dto)) {
+                dto.setUserName("SYSTEM GENERATED");
+            }
+            
+            return dto;
+        });
+    }
+}

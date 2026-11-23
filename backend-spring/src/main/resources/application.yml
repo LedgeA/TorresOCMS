@@ -1,0 +1,51 @@
+spring:
+  application:
+    name: OpticalClinicManagementSystem
+
+  task:
+    scheduling:
+      default-timezone: Asia/Manila
+
+  servlet:
+    multipart:
+      max-file-size: 2GB
+      max-request-size: 2GB
+
+  datasource:
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+    driver-class-name: org.postgresql.Driver
+
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:postgresql-extensions.sql
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    database: postgresql
+    show-sql: true
+
+app:
+  jwt:
+    secret: ${JWT_SECRET}
+    expiration-ms: 86400000
+
+  upload:
+    product-images-dir: ${APP_UPLOAD_PRODUCT_IMAGES_DIR:uploads/products}
+
+  database:
+    backup:
+      use-docker: ${APP_DATABASE_BACKUP_USE_DOCKER:false}
+      docker-container: ${APP_DATABASE_BACKUP_DOCKER_CONTAINER:postgres-db}
+
+server:
+  port: 8080
+
+encryption:
+  secret-key: ${ENCRYPTION_SECRET_KEY}
+
+hash:
+  pepper: ${HASH_PEPPER}

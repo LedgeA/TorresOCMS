@@ -1,0 +1,109 @@
+package com.mmtorresoptical.OpticalClinicManagementSystem.controller.report;
+
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.ActionType;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.ReportType;
+import com.mmtorresoptical.OpticalClinicManagementSystem.enums.ResourceType;
+import com.mmtorresoptical.OpticalClinicManagementSystem.exception.custom.BadRequestException;
+import com.mmtorresoptical.OpticalClinicManagementSystem.repository.TransactionRepository;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.auditlog.AuditLogService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.helper.JSONService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.report.ComprehensiveInventoryReportDataset;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.report.PatientReportDataset;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.report.ReportAggregationService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.dto.metrics.TransactionMonthlyTrendPoint;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.report.TransactionPdfAggregationService;
+import com.mmtorresoptical.OpticalClinicManagementSystem.services.report.transactionpdf.TransactionHierarchicalReportDataset;
+import lombok.RequiredArgsConstructor;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.List;
+
+@RestController
+@RequiredArgsConstructor
+@RequestMapping("/api/reports")
+public class ReportDataController {
+
+    private final TransactionPdfAggregationService transactionPdfAggregationService;
+    private final ReportAggregationService reportAggregationService;
+    private final TransactionRepository transactionRepository;
+    private final AuditLogService auditLogService;
+    private final JSONService jsonService;
+
+    @GetMapping("/data/{reportType}")
+    public ResponseEntity<?> getReportData(
+            @PathVariable ReportType reportType,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate minDate,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate maxDate
+    ) {
+        return switch (reportType) {
+            case TRANSACTIONS -> {
+                LocalDate effectiveMin = minDate;
+                LocalDate effectiveMax = maxDate;
+                if (effectiveMin == null || effectiveMax == null) {
+                    LocalDateTime dbMin = transactionRepository.findMinTransactionDate();
+                    LocalDateTime dbMax = transactionRepository.findMaxTransactionDate();
+                    if (effectiveMin == null) {
+                        effectiveMin = dbMin != null ? dbMin.toLocalDate() : LocalDate.of(2020, 1, 1);
+                    }
+                    if (effectiveMax == null) {
+                        effectiveMax = dbMax != null ? dbMax.toLocalDate() : LocalDate.of(2099, 12, 31);
+                    }
+                }
+                TransactionHierarchicalReportDataset dataset =
+                        transactionPdfAggregationService.buildTransactionReport(effectiveMin, effectiveMax);
+                yield ResponseEntity.ok(dataset);
+            }
+            case PATIENTS -> {
+                PatientReportDataset dataset =
+                        reportAggregationService.buildPatientReport(reportType, minDate, maxDate);
+                yield ResponseEntity.ok(dataset);
+            }
+            case INVENTORY_ANALYTICS -> {
+                ComprehensiveInventoryReportDataset dataset =
+                        reportAggregationService.buildInventoryAnalyticsReport();
+                yield ResponseEntity.ok(dataset);
+            }
+            default -> throw new BadRequestException(
+                    "Report data endpoint currently supports TRANSACTIONS, PATIENTS, and INVENTORY_ANALYTICS report types.");
+        };
+    }
+
+    @GetMapping("/patient-growth-trend")
+    public ResponseEntity<List<PatientReportDataset.PatientGrowthPoint>> getPatientGrowthTrend() {
+        return ResponseEntity.ok(reportAggregationService.computePatientGrowthTrend());
+    }
+
+    @GetMapping("/transaction-monthly-trend")
+    public ResponseEntity<List<TransactionMonthlyTrendPoint>> getTransactionMonthlyTrend() {
+        return ResponseEntity.ok(reportAggregationService.computeTransactionMonthlyTrend());
+    }
+
+    @PostMapping("/{reportType}/log-export")
+    public ResponseEntity<Void> logReportExport(@PathVariable ReportType reportType) {
+        String label = capitalizeWords(reportType.name().replace("_", " "));
+        String details = "Exported PDF: " + label + " report";
+        String detailsJson = jsonService.toJson(
+                java.util.Map.of("reportType", reportType.name(), "format", "PDF"));
+        auditLogService.log(ActionType.EXPORT, ResourceType.REPORT, null, details, detailsJson);
+        return ResponseEntity.ok().build();
+    }
+
+    private String capitalizeWords(String input) {
+        String[] words = input.split(" ");
+        StringBuilder sb = new StringBuilder();
+        for (String word : words) {
+            if (!sb.isEmpty()) sb.append(" ");
+            sb.append(word.substring(0, 1).toUpperCase()).append(word.substring(1).toLowerCase());
+        }
+        return sb.toString();
+    }
+}
